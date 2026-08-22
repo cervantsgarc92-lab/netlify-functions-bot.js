@@ -1,124 +1,146 @@
 // netlify/functions/bot.js
-// Hito 2: el bot ahora conecta a Firestore
+// Hito 3: el bot lee los catálogos de Firestore y reconoce a los jefes de turno.
 
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const SECRET = process.env.TELEGRAM_SECRET;
-const FIREBASE_PROJECT = process.env.FIREBASE_PROJECT_ID;
-const API = `https://api.telegram.org/bot${TOKEN}`;
-const FIRESTORE_API = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
+const PROJECT = process.env.FIREBASE_PROJECT_ID;
+const API_KEY = process.env.FIREBASE_API_KEY;
 
-// Enviar un mensaje de vuelta a Telegram
+const TG = `https://api.telegram.org/bot${TOKEN}`;
+const FS = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
+
+// ---------- Telegram ----------
+
 async function enviarMensaje(chatId, texto, extra = {}) {
-  const res = await fetch(`${API}/sendMessage`, {
+  const res = await fetch(`${TG}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: texto, parse_mode: "HTML", ...extra }),
+  });
+  if (!res.ok) console.error("sendMessage falló:", res.status, await res.text());
+}
+
+// ---------- Firestore ----------
+
+// Convierte el formato de Firestore ({stringValue: "x"}) a algo normal ("x")
+function planos(fields = {}) {
+  const salida = {};
+  for (const [clave, envoltorio] of Object.entries(fields)) {
+    const tipo = Object.keys(envoltorio)[0];
+    let valor = envoltorio[tipo];
+    if (tipo === "integerValue") valor = parseInt(valor, 10);
+    salida[clave] = valor;
+  }
+  return salida;
+}
+
+// Consulta una colección filtrando por un campo
+async function consultar(coleccion, campo, valor, tipoValor = "stringValue") {
+  const res = await fetch(`${FS}:runQuery?key=${API_KEY}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      chat_id: chatId,
-      text: texto,
-      parse_mode: "HTML",
-      ...extra,
+      structuredQuery: {
+        from: [{ collectionId: coleccion }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: campo },
+            op: "EQUAL",
+            value: { [tipoValor]: String(valor) },
+          },
+        },
+      },
     }),
   });
 
   if (!res.ok) {
-    console.error("sendMessage falló:", res.status, await res.text());
-  }
-}
-
-// Buscar un jefe de turno en Firestore por ID de Telegram
-async function buscarJefeTurno(telegramId) {
-  try {
-    const query = `${FIRESTORE_API}/jefes_turno?pageSize=100`;
-    const res = await fetch(query);
-
-    if (!res.ok) return null;
-
-    const data = await res.json();
-    if (!data.documents) return null;
-
-    for (const doc of data.documents) {
-      const fields = doc.fields || {};
-      if (fields.telegram_id?.integerValue == telegramId) {
-        return {
-          id: doc.name.split("/").pop(),
-          nombre: fields.nombre?.stringValue,
-          instalacion: fields.instalacion?.stringValue,
-          ...fields,
-        };
-      }
-    }
-  } catch (e) {
-    console.error("Error buscando jefe:", e.message);
+    console.error(`Firestore falló (${coleccion}):`, res.status, await res.text());
+    return [];
   }
 
-  return null;
+  const data = await res.json();
+  return data
+    .filter((fila) => fila.document)
+    .map((fila) => ({
+      id: fila.document.name.split("/").pop(),
+      ...planos(fila.document.fields),
+    }));
 }
+
+const buscarJefe = async (telegramId) =>
+  (await consultar("jefes_turno", "telegram_id", telegramId, "integerValue"))[0] || null;
+
+const elementosDe = async (instalacion) =>
+  (await consultar("elementos", "instalacion", instalacion))
+    .filter((e) => e.activo !== false)
+    .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+
+// ---------- Handler ----------
 
 exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 200, body: "Bot vivo" };
-  }
+  if (event.httpMethod !== "POST") return { statusCode: 200, body: "Bot vivo" };
 
-  const secretRecibido = event.headers["x-telegram-bot-api-secret-token"];
-  if (SECRET && secretRecibido !== SECRET) {
+  if (SECRET && event.headers["x-telegram-bot-api-secret-token"] !== SECRET) {
     return { statusCode: 401, body: "no autorizado" };
   }
 
   let update;
   try {
     update = JSON.parse(event.body || "{}");
-  } catch (e) {
+  } catch {
     return { statusCode: 200, body: "ok" };
   }
 
   const msg = update.message;
+  if (!msg || !msg.text) return { statusCode: 200, body: "ok" };
 
-  if (msg && msg.text) {
-    const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const nombre = msg.from.first_name || "";
-    const texto = msg.text.trim();
+  const chatId = msg.chat.id;
+  const telegramId = msg.from.id;
+  const texto = msg.text.trim();
+
+  try {
+    const jefe = await buscarJefe(telegramId);
 
     if (texto.startsWith("/start")) {
-      // Buscar si ya está registrado
-      const jefe = await buscarJefeTurno(telegramId);
-
       if (jefe) {
+        const elementos = await elementosDe(jefe.instalacion);
         await enviarMensaje(
           chatId,
-          `Bienvenido de vuelta, ${jefe.nombre}.\n\n` +
-            `Tu instalación: ${jefe.instalacion}\n\n` +
-            `Usa /resguardo para reportar resguardos.`
+          `Hola ${jefe.nombre}.\n\n` +
+            `Instalación: <b>${jefe.instalacion.toUpperCase()}</b>\n` +
+            `Elementos a tu cargo: <b>${elementos.length}</b>\n\n` +
+            `Usa /resguardo para reportar quién resguardó.`
         );
       } else {
         await enviarMensaje(
           chatId,
-          `Hola ${nombre}. Soy el bot de Protección y Seguridad.\n\n` +
+          `Hola ${msg.from.first_name || ""}. Soy el bot de Protección y Seguridad.\n\n` +
             `Tu ID de Telegram es: <code>${telegramId}</code>\n\n` +
-            `Envíaselo a Efraín para que te dé de alta como jefe de turno.`
+            `Envíaselo a Efraín para que te dé de alta.`
         );
       }
-    } else if (texto.startsWith("/resguardo")) {
-      const jefe = await buscarJefeTurno(telegramId);
+      return { statusCode: 200, body: "ok" };
+    }
 
+    if (texto.startsWith("/resguardo")) {
       if (!jefe) {
-        await enviarMensaje(
-          chatId,
-          "No estás registrado aún. Usa /start para enviar tu ID a Efraín."
-        );
-      } else {
-        await enviarMensaje(
-          chatId,
-          `Resguardo para ${jefe.instalacion}.\n\n` +
-            `Próximamente: seleccionarás qué elementos resguardaron hoy.`
-        );
+        await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín.");
+        return { statusCode: 200, body: "ok" };
       }
-    } else {
+      const elementos = await elementosDe(jefe.instalacion);
+      const lista = elementos.map((e) => `• ${e.nombre} (${e.clave})`).join("\n");
       await enviarMensaje(
         chatId,
-        `Recibí tu mensaje: "${texto}"\n\nComandos: /start, /resguardo`
+        `<b>${jefe.instalacion.toUpperCase()}</b> — ${elementos.length} elementos:\n\n${lista}\n\n` +
+          `<i>Los botones para seleccionar vienen en el siguiente paso.</i>`
       );
+      return { statusCode: 200, body: "ok" };
     }
+
+    await enviarMensaje(chatId, "Comandos disponibles: /start y /resguardo");
+  } catch (e) {
+    console.error("Error:", e.message);
+    await enviarMensaje(chatId, "Algo falló. Ya quedó registrado en el log.");
   }
 
   return { statusCode: 200, body: "ok" };
