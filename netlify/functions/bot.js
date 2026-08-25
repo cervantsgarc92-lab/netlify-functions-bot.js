@@ -1,21 +1,21 @@
 // netlify/functions/bot.js
-// Hito 5: agrega /exportar (solo coordinador) sobre el flujo de resguardo del Hito 4.
+// Bot v7:
+//   - Resguardo (v6) intacto: /resguardo, /exportar
+//   - NUEVO: /resumen como comando (solo coordinador)
+//   - NUEVO: esqueleto de /turno con botones inline (abrir turno: mañana/tarde/noche)
 //
 // Colecciones:
-//   instalaciones, elementos, jefes_turno  (catálogos)
-//   sesiones     (estado temporal del flujo /resguardo)
-//   resguardos   (registro final: un doc por fecha+clave; campo "exportado")
+//   instalaciones, elementos, jefes_turno   (catálogos)
+//   sesiones      (estado del flujo /resguardo)
+//   resguardos    (registro final de resguardos)
+//   turnos        (turnos abiertos/cerrados)   <-- nueva
 
 const TOKEN = process.env.TELEGRAM_TOKEN;
 const SECRET = process.env.TELEGRAM_SECRET;
 const PROJECT = process.env.FIREBASE_PROJECT_ID;
 const API_KEY = process.env.FIREBASE_API_KEY;
-
-// IDs de Telegram con permiso de coordinador (separados por coma en la variable)
 const COORDINADORES = (process.env.COORDINADOR_IDS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 const TG = `https://api.telegram.org/bot${TOKEN}`;
 const FS = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
@@ -31,33 +31,44 @@ async function enviarMensaje(chatId, texto, extra = {}) {
   if (!res.ok) console.error("sendMessage falló:", res.status, await res.text());
 }
 
-// Envía un archivo (documento) al chat
+async function editarMensaje(chatId, messageId, texto, extra = {}) {
+  const res = await fetch(`${TG}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: texto, parse_mode: "HTML", ...extra }),
+  });
+  if (!res.ok) console.error("editMessageText falló:", res.status, await res.text());
+}
+
+// Responde el "reloj de carga" de un botón inline (obligatorio para que Telegram no lo deje girando)
+async function responderCallback(callbackId, texto = "") {
+  await fetch(`${TG}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackId, text: texto }),
+  });
+}
+
+// Envía un documento (CSV) al chat
 async function enviarDocumento(chatId, nombreArchivo, contenido, caption = "") {
   const boundary = "----csv" + Date.now();
   const partes = [];
   const push = (s) => partes.push(Buffer.from(s, "utf-8"));
-
   push(`--${boundary}\r\n`);
   push(`Content-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`);
-
   if (caption) {
     push(`--${boundary}\r\n`);
     push(`Content-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`);
   }
-
   push(`--${boundary}\r\n`);
   push(`Content-Disposition: form-data; name="document"; filename="${nombreArchivo}"\r\n`);
   push(`Content-Type: text/csv; charset=utf-8\r\n\r\n`);
-  push("\uFEFF" + contenido); // BOM para que Excel respete acentos
+  push("\uFEFF" + contenido);
   push(`\r\n--${boundary}--\r\n`);
-
   const cuerpo = Buffer.concat(partes);
   const res = await fetch(`${TG}/sendDocument`, {
     method: "POST",
-    headers: {
-      "Content-Type": `multipart/form-data; boundary=${boundary}`,
-      "Content-Length": String(cuerpo.length),
-    },
+    headers: { "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": String(cuerpo.length) },
     body: cuerpo,
   });
   if (!res.ok) console.error("sendDocument falló:", res.status, await res.text());
@@ -67,39 +78,29 @@ async function enviarDocumento(chatId, nombreArchivo, contenido, caption = "") {
 // ============ Firestore: formato ============
 
 function planos(fields = {}) {
-  const salida = {};
-  for (const [clave, envoltorio] of Object.entries(fields)) {
-    const tipo = Object.keys(envoltorio)[0];
-    let valor = envoltorio[tipo];
-    if (tipo === "integerValue") valor = parseInt(valor, 10);
-    else if (tipo === "arrayValue") {
-      valor = (valor.values || []).map((v) => {
-        const t = Object.keys(v)[0];
-        return t === "integerValue" ? parseInt(v[t], 10) : v[t];
-      });
-    }
-    salida[clave] = valor;
+  const s = {};
+  for (const [k, env] of Object.entries(fields)) {
+    const t = Object.keys(env)[0];
+    let v = env[t];
+    if (t === "integerValue") v = parseInt(v, 10);
+    else if (t === "arrayValue") v = (v.values || []).map((x) => {
+      const tt = Object.keys(x)[0];
+      return tt === "integerValue" ? parseInt(x[tt], 10) : x[tt];
+    });
+    s[k] = v;
   }
-  return salida;
+  return s;
 }
 
 function aFirestore(obj) {
-  const fields = {};
-  for (const [clave, valor] of Object.entries(obj)) {
-    if (typeof valor === "boolean") fields[clave] = { booleanValue: valor };
-    else if (typeof valor === "number" && Number.isInteger(valor))
-      fields[clave] = { integerValue: String(valor) };
-    else if (Array.isArray(valor))
-      fields[clave] = {
-        arrayValue: {
-          values: valor.map((v) =>
-            Number.isInteger(v) ? { integerValue: String(v) } : { stringValue: String(v) }
-          ),
-        },
-      };
-    else fields[clave] = { stringValue: String(valor) };
+  const f = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === "boolean") f[k] = { booleanValue: v };
+    else if (typeof v === "number" && Number.isInteger(v)) f[k] = { integerValue: String(v) };
+    else if (Array.isArray(v)) f[k] = { arrayValue: { values: v.map((x) => Number.isInteger(x) ? { integerValue: String(x) } : { stringValue: String(x) }) } };
+    else f[k] = { stringValue: String(v) };
   }
-  return fields;
+  return f;
 }
 
 // ============ Firestore: operaciones ============
@@ -111,44 +112,13 @@ async function consultar(coleccion, campo, valor, tipoValor = "stringValue") {
     body: JSON.stringify({
       structuredQuery: {
         from: [{ collectionId: coleccion }],
-        where: {
-          fieldFilter: {
-            field: { fieldPath: campo },
-            op: "EQUAL",
-            value: { [tipoValor]: String(valor) },
-          },
-        },
+        where: { fieldFilter: { field: { fieldPath: campo }, op: "EQUAL", value: { [tipoValor]: String(valor) } } },
       },
     }),
   });
-  if (!res.ok) {
-    console.error(`runQuery falló (${coleccion}):`, res.status, await res.text());
-    return [];
-  }
+  if (!res.ok) { console.error(`runQuery falló (${coleccion}):`, res.status); return []; }
   const data = await res.json();
-  return data
-    .filter((f) => f.document)
-    .map((f) => ({ id: f.document.name.split("/").pop(), ...planos(f.document.fields) }));
-}
-
-// Trae toda una colección (paginada)
-async function listar(coleccion) {
-  const salida = [];
-  let pageToken = "";
-  do {
-    const url = `${FS}/${coleccion}?key=${API_KEY}&pageSize=300${pageToken ? `&pageToken=${pageToken}` : ""}`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      console.error(`listar falló (${coleccion}):`, res.status);
-      break;
-    }
-    const data = await res.json();
-    (data.documents || []).forEach((d) =>
-      salida.push({ id: d.name.split("/").pop(), ...planos(d.fields) })
-    );
-    pageToken = data.nextPageToken || "";
-  } while (pageToken);
-  return salida;
+  return data.filter((f) => f.document).map((f) => ({ id: f.document.name.split("/").pop(), ...planos(f.document.fields) }));
 }
 
 async function leerDoc(coleccion, id) {
@@ -159,9 +129,7 @@ async function leerDoc(coleccion, id) {
 }
 
 async function escribirDoc(coleccion, id, obj) {
-  const mask = Object.keys(obj)
-    .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
-    .join("&");
+  const mask = Object.keys(obj).map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
   const res = await fetch(`${FS}/${coleccion}/${id}?key=${API_KEY}&${mask}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -177,7 +145,7 @@ async function borrarDoc(coleccion, id) {
 
 // ============ Dominio ============
 
-const esCoordinador = (telegramId) => COORDINADORES.includes(String(telegramId));
+const esCoordinador = (id) => COORDINADORES.includes(String(id));
 
 const buscarJefe = async (telegramId) =>
   (await consultar("jefes_turno", "telegram_id", telegramId, "integerValue"))[0] || null;
@@ -199,6 +167,10 @@ function viernesDeEstaSemana() {
   return hoy.toISOString().split("T")[0];
 }
 
+function hoyISO() {
+  return new Date().toISOString().split("T")[0];
+}
+
 function fechaBonita(iso) {
   const dias = ["dom", "lun", "mar", "mié", "jue", "vie", "sáb"];
   const meses = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
@@ -211,66 +183,114 @@ const guardarSesion = (chatId, datos) => escribirDoc("sesiones", String(chatId),
 const borrarSesion = (chatId) => borrarDoc("sesiones", String(chatId));
 
 function pintarLista(instalacion, fecha, elementos, seleccion) {
-  const items = elementos
-    .map((e, i) => `${seleccion.includes(i) ? "✅" : "▫️"} ${i + 1}. ${e.nombre}`)
-    .join("\n");
-  return (
-    `<b>${instalacion.toUpperCase()}</b> · Resguardo ${fechaBonita(fecha)}\n\n` +
-    items +
-    `\n\n<i>Escribe los números de quienes resguardaron (ej: <code>1 3 5</code>).\n` +
-    `Cuando termines escribe <code>ok</code>.</i>`
-  );
+  const items = elementos.map((e, i) => `${seleccion.includes(i) ? "✅" : "▫️"} ${i + 1}. ${e.nombre}`).join("\n");
+  return `<b>${instalacion.toUpperCase()}</b> · Resguardo ${fechaBonita(fecha)}\n\n${items}\n\n` +
+    `<i>Escribe los números de quienes resguardaron (ej: <code>1 3 5</code>).\nCuando termines escribe <code>ok</code>.</i>`;
 }
 
-// Escapa un campo para CSV
 function csvCampo(v) {
   const s = String(v == null ? "" : v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
+
+const INSTALACIONES_ACTIVAS = ["ceuta", "bellavista", "tayoltita", "caimanes", "campo-5"];
 
 // ============ /exportar ============
 
 async function exportar(chatId) {
   const pendientes = (await consultar("resguardos", "exportado", false, "booleanValue"))
     .sort((a, b) => (a.fecha + a.clave).localeCompare(b.fecha + b.clave));
+  if (!pendientes.length) { await enviarMensaje(chatId, "No hay resguardos pendientes de exportar."); return; }
 
-  if (!pendientes.length) {
-    await enviarMensaje(chatId, "No hay resguardos pendientes de exportar.");
-    return;
-  }
-
-  // CSV: columnas que copiarás a tu formato de pagos
   const encabezado = ["CLAVE", "NOMBRE", "FECHA", "INSTALACION"];
-  const filas = pendientes.map((r) =>
-    [r.clave, r.nombre, r.fecha, r.instalacion].map(csvCampo).join(",")
-  );
+  const filas = pendientes.map((r) => [r.clave, r.nombre, r.fecha, r.instalacion].map(csvCampo).join(","));
   const csv = [encabezado.join(","), ...filas].join("\r\n");
 
-  // Resumen por fecha e instalación
   const fechas = [...new Set(pendientes.map((r) => r.fecha))].sort();
-  const porInst = {};
-  pendientes.forEach((r) => (porInst[r.instalacion] = (porInst[r.instalacion] || 0) + 1));
-  const resumen =
-    `Resguardos: <b>${pendientes.length}</b>\n` +
-    `Fechas: ${fechas.map(fechaBonita).join(", ")}\n` +
-    Object.entries(porInst)
-      .map(([i, n]) => `• ${i.toUpperCase()}: ${n}`)
-      .join("\n");
-
   const nombre = `resguardos_${fechas[0]}_a_${fechas[fechas.length - 1]}.csv`;
   const ok = await enviarDocumento(chatId, nombre, csv, "Resguardos pendientes");
+  if (!ok) { await enviarMensaje(chatId, "No pude generar el archivo. Revisa el log."); return; }
 
-  if (!ok) {
-    await enviarMensaje(chatId, "No pude generar el archivo. Revisa el log.");
-    return;
-  }
-
-  // Marcar como exportado
   for (const r of pendientes) {
     await escribirDoc("resguardos", r.id, { exportado: true, exportado_en: new Date().toISOString() });
   }
+  await enviarMensaje(chatId, `✅ Exportado y marcado. ${pendientes.length} resguardo(s).`);
+}
 
-  await enviarMensaje(chatId, `✅ Exportado y marcado.\n\n${resumen}`);
+// ============ /resumen ============
+
+async function resumen(chatId) {
+  const fecha = viernesDeEstaSemana();
+  const resguardos = await consultar("resguardos", "fecha", fecha);
+
+  const porInst = {};
+  resguardos.forEach((r) => {
+    porInst[r.instalacion] = porInst[r.instalacion] || { total: 0, quien: r.reportado_por };
+    porInst[r.instalacion].total++;
+  });
+
+  const reportaron = [], faltaron = [];
+  for (const inst of INSTALACIONES_ACTIVAS) {
+    if (porInst[inst]) reportaron.push(`✅ ${inst.toUpperCase()}: ${porInst[inst].total} (${porInst[inst].quien})`);
+    else faltaron.push(`❌ ${inst.toUpperCase()}: sin reporte`);
+  }
+
+  let msg = `<b>Resumen de resguardos</b>\n${fechaBonita(fecha)}\n\n`;
+  if (reportaron.length) msg += reportaron.join("\n") + "\n";
+  if (faltaron.length) msg += "\n" + faltaron.join("\n") + "\n";
+  msg += `\n<b>${reportaron.length} de ${INSTALACIONES_ACTIVAS.length}</b> instalaciones reportaron.`;
+  await enviarMensaje(chatId, msg);
+}
+
+// ============ /turno (esqueleto - hito 1) ============
+
+// Teclado para elegir el turno
+const tecladoTurno = {
+  inline_keyboard: [
+    [{ text: "🌅 Mañana", callback_data: "turno_abrir_manana" }],
+    [{ text: "☀️ Tarde", callback_data: "turno_abrir_tarde" }],
+    [{ text: "🌙 Noche", callback_data: "turno_abrir_noche" }],
+  ],
+};
+
+const NOMBRE_TURNO = { manana: "Mañana", tarde: "Tarde", noche: "Noche" };
+
+// ID del turno: fecha_instalacion_turno (uno por instalación/turno/día)
+const idTurno = (instalacion, fecha, turno) => `${fecha}_${instalacion}_${turno}`;
+
+async function abrirTurno(chatId, jefe, turno, callbackId, messageId) {
+  const fecha = hoyISO();
+  const id = idTurno(jefe.instalacion, fecha, turno);
+
+  const existente = await leerDoc("turnos", id);
+  if (existente && existente.estado === "abierto") {
+    await responderCallback(callbackId, "Ese turno ya está abierto");
+    await editarMensaje(chatId, messageId,
+      `⚠️ El turno <b>${NOMBRE_TURNO[turno]}</b> de <b>${jefe.instalacion.toUpperCase()}</b> ya está abierto.`);
+    return;
+  }
+  if (existente && existente.estado === "cerrado") {
+    await responderCallback(callbackId, "Ese turno ya se cerró");
+    await editarMensaje(chatId, messageId,
+      `⚠️ El turno <b>${NOMBRE_TURNO[turno]}</b> de hoy ya fue cerrado. No se puede reabrir.`);
+    return;
+  }
+
+  await escribirDoc("turnos", id, {
+    instalacion: jefe.instalacion,
+    fecha,
+    turno,
+    estado: "abierto",
+    jefe_abrio: jefe.nombre,
+    abierto_en: new Date().toISOString(),
+  });
+
+  await responderCallback(callbackId, "Turno abierto");
+  await editarMensaje(chatId, messageId,
+    `✅ Turno <b>${NOMBRE_TURNO[turno]}</b> abierto\n` +
+    `<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}\n\n` +
+    `<i>Durante el turno podrás registrar reportes.\nAl terminar, usa /turno y elige Cerrar turno.\n\n` +
+    `(El cierre y sus reportes vienen en el siguiente paso.)</i>`);
 }
 
 // ============ Handler ============
@@ -282,12 +302,35 @@ exports.handler = async (event) => {
   }
 
   let update;
-  try {
-    update = JSON.parse(event.body || "{}");
-  } catch {
+  try { update = JSON.parse(event.body || "{}"); } catch { return { statusCode: 200, body: "ok" }; }
+
+  // ---------- Botones inline (callback_query) ----------
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const chatId = cq.message.chat.id;
+    const messageId = cq.message.message_id;
+    const telegramId = cq.from.id;
+    const data = cq.data || "";
+
+    try {
+      const jefe = await buscarJefe(telegramId);
+      if (!jefe) {
+        await responderCallback(cq.id, "No estás dado de alta");
+        return { statusCode: 200, body: "ok" };
+      }
+
+      if (data === "turno_abrir_manana") await abrirTurno(chatId, jefe, "manana", cq.id, messageId);
+      else if (data === "turno_abrir_tarde") await abrirTurno(chatId, jefe, "tarde", cq.id, messageId);
+      else if (data === "turno_abrir_noche") await abrirTurno(chatId, jefe, "noche", cq.id, messageId);
+      else await responderCallback(cq.id);
+    } catch (e) {
+      console.error("Error callback:", e.message);
+      await responderCallback(cq.id, "Algo falló");
+    }
     return { statusCode: 200, body: "ok" };
   }
 
+  // ---------- Mensajes de texto ----------
   const msg = update.message;
   if (!msg || !msg.text) return { statusCode: 200, body: "ok" };
 
@@ -299,35 +342,32 @@ exports.handler = async (event) => {
   try {
     const jefe = await buscarJefe(telegramId);
 
-    // ---- /start ----
+    // /start
     if (texto.startsWith("/start")) {
-      const rolExtra = esCoordinador(telegramId) ? "\n\n(Coordinador: puedes usar /exportar)" : "";
+      const extra = esCoordinador(telegramId) ? "\n\n(Coordinador: /resumen y /exportar)" : "";
       if (jefe) {
-        const elementos = await elementosDe(jefe.instalacion);
-        await enviarMensaje(
-          chatId,
-          `Hola ${jefe.nombre}.\n\n` +
-            `Instalación: <b>${jefe.instalacion.toUpperCase()}</b>\n` +
-            `Elementos: <b>${elementos.length}</b>\n\n` +
-            `Usa /resguardo para reportar.${rolExtra}`
-        );
+        const els = await elementosDe(jefe.instalacion);
+        await enviarMensaje(chatId,
+          `Hola ${jefe.nombre}.\n\nInstalación: <b>${jefe.instalacion.toUpperCase()}</b>\n` +
+          `Elementos: <b>${els.length}</b>\n\nComandos: /resguardo · /turno${extra}`);
       } else {
-        await enviarMensaje(
-          chatId,
-          `Hola ${msg.from.first_name || ""}.\n\n` +
-            `Tu ID: <code>${telegramId}</code>\n\n` +
-            `Envíaselo a Efraín para que te dé de alta.${rolExtra}`
-        );
+        await enviarMensaje(chatId,
+          `Hola ${msg.from.first_name || ""}.\n\nTu ID: <code>${telegramId}</code>\n\n` +
+          `Envíaselo a Efraín para que te dé de alta.${extra}`);
       }
       return { statusCode: 200, body: "ok" };
     }
 
-    // ---- /exportar (solo coordinador) ----
+    // /resumen (coordinador)
+    if (texto.startsWith("/resumen")) {
+      if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; }
+      await resumen(chatId);
+      return { statusCode: 200, body: "ok" };
+    }
+
+    // /exportar (coordinador)
     if (texto.startsWith("/exportar")) {
-      if (!esCoordinador(telegramId)) {
-        await enviarMensaje(chatId, "Este comando es solo para el coordinador.");
-        return { statusCode: 200, body: "ok" };
-      }
+      if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; }
       await exportar(chatId);
       return { statusCode: 200, body: "ok" };
     }
@@ -337,67 +377,54 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: "ok" };
     }
 
-    // ---- /cancelar ----
+    // /turno (esqueleto: por ahora solo abrir)
+    if (texto.startsWith("/turno")) {
+      await enviarMensaje(chatId,
+        `<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(hoyISO())}\n\n` +
+        `¿Qué turno vas a abrir?`,
+        { reply_markup: tecladoTurno });
+      return { statusCode: 200, body: "ok" };
+    }
+
+    // /cancelar (resguardo)
     if (texto.startsWith("/cancelar")) {
       await borrarSesion(chatId);
       await enviarMensaje(chatId, "Resguardo cancelado. Usa /resguardo para empezar de nuevo.");
       return { statusCode: 200, body: "ok" };
     }
 
-    // ---- /resguardo ----
+    // /resguardo
     if (texto.startsWith("/resguardo")) {
       const fecha = viernesDeEstaSemana();
       if (await yaReportado(jefe.instalacion, fecha)) {
-        await enviarMensaje(
-          chatId,
-          `⚠️ Ya se reportó el resguardo de <b>${jefe.instalacion.toUpperCase()}</b> ` +
-            `para el ${fechaBonita(fecha)}.\n\nSi hubo un error, avísale a Efraín.`
-        );
+        await enviarMensaje(chatId, `⚠️ Ya se reportó el resguardo de <b>${jefe.instalacion.toUpperCase()}</b> para el ${fechaBonita(fecha)}.\n\nSi hubo un error, avísale a Efraín.`);
         return { statusCode: 200, body: "ok" };
       }
-      const elementos = await elementosDe(jefe.instalacion);
-      await guardarSesion(chatId, {
-        instalacion: jefe.instalacion,
-        fecha,
-        seleccion: [],
-        paso: "seleccionando",
-      });
-      await enviarMensaje(chatId, pintarLista(jefe.instalacion, fecha, elementos, []));
+      const els = await elementosDe(jefe.instalacion);
+      await guardarSesion(chatId, { instalacion: jefe.instalacion, fecha, seleccion: [], paso: "seleccionando" });
+      await enviarMensaje(chatId, pintarLista(jefe.instalacion, fecha, els, []));
       return { statusCode: 200, body: "ok" };
     }
 
-    // ---- Mensajes dentro del flujo ----
+    // Dentro del flujo de resguardo
     const sesion = await leerSesion(chatId);
     if (!sesion || !sesion.paso) {
-      await enviarMensaje(chatId, "Usa /resguardo para comenzar.");
+      await enviarMensaje(chatId, "Usa /resguardo o /turno para comenzar.");
       return { statusCode: 200, body: "ok" };
     }
-
-    const elementos = await elementosDe(sesion.instalacion);
+    const els = await elementosDe(sesion.instalacion);
 
     if (sesion.paso === "confirmando") {
       if (texto === "si" || texto === "sí" || texto === "ok") {
-        const seleccion = sesion.seleccion || [];
-        for (const idx of seleccion) {
-          const el = elementos[idx];
-          if (!el) continue;
+        for (const idx of (sesion.seleccion || [])) {
+          const el = els[idx]; if (!el) continue;
           await escribirDoc("resguardos", `${sesion.fecha}_${el.clave}`, {
-            instalacion: sesion.instalacion,
-            clave: el.clave,
-            nombre: el.nombre,
-            fecha: sesion.fecha,
-            reportado_por: jefe.nombre,
-            reportado_en: new Date().toISOString(),
-            exportado: false,
+            instalacion: sesion.instalacion, clave: el.clave, nombre: el.nombre, fecha: sesion.fecha,
+            reportado_por: jefe.nombre, reportado_en: new Date().toISOString(), exportado: false,
           });
         }
         await borrarSesion(chatId);
-        await enviarMensaje(
-          chatId,
-          `✅ Resguardo guardado.\n\n` +
-            `<b>${sesion.instalacion.toUpperCase()}</b> · ${fechaBonita(sesion.fecha)}\n` +
-            `Elementos: <b>${seleccion.length}</b>\n\nGracias, ${jefe.nombre}.`
-        );
+        await enviarMensaje(chatId, `✅ Resguardo guardado.\n\n<b>${sesion.instalacion.toUpperCase()}</b> · ${fechaBonita(sesion.fecha)}\nElementos: <b>${(sesion.seleccion || []).length}</b>\n\nGracias, ${jefe.nombre}.`);
         return { statusCode: 200, body: "ok" };
       }
       if (texto === "cambiar" || texto === "cambiar fecha") {
@@ -410,22 +437,12 @@ exports.handler = async (event) => {
     }
 
     if (sesion.paso === "esperando_fecha") {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) {
-        await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>.");
-        return { statusCode: 200, body: "ok" };
-      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
       const d = new Date(bruto + "T12:00:00");
-      if (d.getDay() !== 5) {
-        await enviarMensaje(chatId, "⚠️ Esa fecha no es viernes. Escribe otra.");
-        return { statusCode: 200, body: "ok" };
-      }
-      if (await yaReportado(sesion.instalacion, bruto)) {
-        await enviarMensaje(chatId, `⚠️ Ya hay resguardo para ${fechaBonita(bruto)}. Avísale a Efraín.`);
-        await borrarSesion(chatId);
-        return { statusCode: 200, body: "ok" };
-      }
+      if (d.getDay() !== 5) { await enviarMensaje(chatId, "⚠️ Esa fecha no es viernes. Escribe otra."); return { statusCode: 200, body: "ok" }; }
+      if (await yaReportado(sesion.instalacion, bruto)) { await enviarMensaje(chatId, `⚠️ Ya hay resguardo para ${fechaBonita(bruto)}. Avísale a Efraín.`); await borrarSesion(chatId); return { statusCode: 200, body: "ok" }; }
       await guardarSesion(chatId, { ...sesion, fecha: bruto, paso: "confirmando" });
-      const nombres = (sesion.seleccion || []).map((i) => `• ${elementos[i].nombre}`).join("\n");
+      const nombres = (sesion.seleccion || []).map((i) => `• ${els[i].nombre}`).join("\n");
       await enviarMensaje(chatId, `Resguardo del <b>${fechaBonita(bruto)}</b>:\n\n${nombres}\n\n¿Confirmas? "<code>sí</code>".`);
       return { statusCode: 200, body: "ok" };
     }
@@ -433,40 +450,21 @@ exports.handler = async (event) => {
     if (sesion.paso === "seleccionando") {
       if (texto === "ok") {
         const seleccion = sesion.seleccion || [];
-        if (!seleccion.length) {
-          await enviarMensaje(chatId, "No has seleccionado a nadie. Escribe los números, o /cancelar.");
-          return { statusCode: 200, body: "ok" };
-        }
+        if (!seleccion.length) { await enviarMensaje(chatId, "No has seleccionado a nadie. Escribe los números, o /cancelar."); return { statusCode: 200, body: "ok" }; }
         await guardarSesion(chatId, { ...sesion, paso: "confirmando" });
-        const nombres = seleccion.map((i) => `• ${elementos[i].nombre}`).join("\n");
-        await enviarMensaje(
-          chatId,
-          `Vas a registrar ${seleccion.length} resguardo(s) para <b>${fechaBonita(sesion.fecha)}</b>:\n\n` +
-            nombres +
-            `\n\n¿La fecha es correcta? "<code>sí</code>" para guardar, "<code>cambiar</code>" para otra fecha.`
-        );
+        const nombres = seleccion.map((i) => `• ${els[i].nombre}`).join("\n");
+        await enviarMensaje(chatId, `Vas a registrar ${seleccion.length} resguardo(s) para <b>${fechaBonita(sesion.fecha)}</b>:\n\n${nombres}\n\n¿La fecha es correcta? "<code>sí</code>" para guardar, "<code>cambiar</code>" para otra fecha.`);
         return { statusCode: 200, body: "ok" };
       }
-
       const numeros = bruto.split(/\s+/).map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
-      if (!numeros.length) {
-        await enviarMensaje(chatId, "Escribe números (ej: <code>1 3 5</code>) o <code>ok</code>.");
-        return { statusCode: 200, body: "ok" };
-      }
-      const invalidos = numeros.filter((n) => n < 1 || n > elementos.length);
-      if (invalidos.length) {
-        await enviarMensaje(chatId, `Fuera de rango: ${invalidos.join(", ")}. Válidos: 1 a ${elementos.length}.`);
-        return { statusCode: 200, body: "ok" };
-      }
+      if (!numeros.length) { await enviarMensaje(chatId, "Escribe números (ej: <code>1 3 5</code>) o <code>ok</code>."); return { statusCode: 200, body: "ok" }; }
+      const invalidos = numeros.filter((n) => n < 1 || n > els.length);
+      if (invalidos.length) { await enviarMensaje(chatId, `Fuera de rango: ${invalidos.join(", ")}. Válidos: 1 a ${els.length}.`); return { statusCode: 200, body: "ok" }; }
       const seleccion = new Set(sesion.seleccion || []);
-      numeros.forEach((n) => {
-        const idx = n - 1;
-        if (seleccion.has(idx)) seleccion.delete(idx);
-        else seleccion.add(idx);
-      });
+      numeros.forEach((n) => { const i = n - 1; seleccion.has(i) ? seleccion.delete(i) : seleccion.add(i); });
       const nueva = [...seleccion].sort((a, b) => a - b);
       await guardarSesion(chatId, { ...sesion, seleccion: nueva });
-      await enviarMensaje(chatId, pintarLista(sesion.instalacion, sesion.fecha, elementos, nueva));
+      await enviarMensaje(chatId, pintarLista(sesion.instalacion, sesion.fecha, els, nueva));
       return { statusCode: 200, body: "ok" };
     }
   } catch (e) {
