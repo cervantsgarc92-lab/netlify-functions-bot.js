@@ -1,4 +1,5 @@
 // netlify/functions/bot.js
+// Bot v10: faltas con botones de motivo (Incapacitado / No avisó / Permiso / Otro)
 // Bot v9:
 //   - Todo lo de v8 (resguardo, /resumen, /exportar, /turno con iniciar/entregar)
 //   - NUEVO: botón "Registrar faltas" dentro del turno en curso
@@ -144,6 +145,15 @@ const tecladoConfirmarCierre = { inline_keyboard: [
   [{ text: "No, seguir", callback_data: "turno_finalizar_no" }],
 ] };
 
+const tecladoMotivo = { inline_keyboard: [
+  [{ text: "🏥 Incapacitado", callback_data: "motivo_incapacitado" }],
+  [{ text: "🚫 No avisó", callback_data: "motivo_no_aviso" }],
+  [{ text: "📄 Permiso", callback_data: "motivo_permiso" }],
+  [{ text: "✏️ Otro (escribir)", callback_data: "motivo_otro" }],
+] };
+
+const ETIQUETA_MOTIVO = { incapacitado: "Incapacitado", no_aviso: "No avisó", permiso: "Permiso" };
+
 async function menuTurno(chatId, jefe, messageIdParaEditar = null) {
   const abierto = await turnoAbierto(jefe.instalacion);
   if (abierto) {
@@ -216,13 +226,61 @@ async function iniciarFaltas(chatId, jefe, callbackId, messageId) {
   const abierto = await turnoAbierto(jefe.instalacion);
   if (!abierto) { await responderCallback(callbackId, "No hay turno abierto"); return; }
   const els = await elementosDe(jefe.instalacion);
-  // Guardar sesión de faltas
   await guardarSesion(chatId, { flujo: "faltas", turno_id: abierto.id, instalacion: jefe.instalacion, paso: "seleccionando_faltas", seleccion: [], pendientes_motivo: [], motivos: {} });
   await responderCallback(callbackId);
   const lista = els.map((e, i) => `${i + 1}. ${e.nombre}`).join("\n");
   await editarMensaje(chatId, messageId,
     `<b>Registrar faltas</b> · ${jefe.instalacion.toUpperCase()}\n\n${lista}\n\n` +
     `<i>Escribe los números de quienes faltaron (ej: <code>2 5</code>).\nSi no faltó nadie, escribe <code>ninguno</code>.</i>`);
+}
+
+// Pide el motivo del siguiente pendiente, con botones
+async function pedirMotivo(chatId, sesion, els) {
+  const idx = (sesion.pendientes_motivo || [])[0];
+  await enviarMensaje(chatId, `Motivo de la falta de <b>${els[idx].nombre}</b>:`, { reply_markup: tecladoMotivo });
+}
+
+// Recibe el motivo elegido por botón
+async function recibirMotivoBoton(chatId, jefe, data, callbackId) {
+  const sesion = await leerSesion(chatId);
+  if (!sesion || sesion.flujo !== "faltas" || sesion.paso !== "motivo") { await responderCallback(callbackId); return; }
+  const els = await elementosDe(sesion.instalacion);
+  const clave = data.replace("motivo_", "");
+  const idx = sesion.pendientes_motivo[0];
+
+  if (clave === "otro") {
+    await responderCallback(callbackId);
+    await guardarSesion(chatId, { ...sesion, paso: "esperando_motivo_otro" });
+    await enviarMensaje(chatId, `Escribe el motivo de <b>${els[idx].nombre}</b>:`);
+    return;
+  }
+
+  const motivos = sesion.motivos || {};
+  motivos[idx] = ETIQUETA_MOTIVO[clave] || clave;
+  await responderCallback(callbackId, ETIQUETA_MOTIVO[clave]);
+  await avanzarMotivo(chatId, jefe, { ...sesion, motivos }, els);
+}
+
+// Avanza al siguiente pendiente o guarda todo si ya no quedan
+async function avanzarMotivo(chatId, jefe, sesion, els) {
+  const restantes = (sesion.pendientes_motivo || []).slice(1);
+  if (restantes.length) {
+    await guardarSesion(chatId, { ...sesion, pendientes_motivo: restantes, paso: "motivo" });
+    await pedirMotivo(chatId, { ...sesion, pendientes_motivo: restantes }, els);
+    return;
+  }
+  for (const idx of (sesion.seleccion || [])) {
+    const el = els[idx];
+    await crearDoc("eventos", {
+      tipo: "falta", turno_id: sesion.turno_id, instalacion: sesion.instalacion,
+      clave: el.clave, nombre: el.nombre, motivo: sesion.motivos[idx] || "",
+      reportado_por: jefe.nombre, fecha: hoyISO(), creado_en: new Date().toISOString(), exportado: false,
+    });
+  }
+  const resumen = (sesion.seleccion || []).map((idx) => `• ${els[idx].nombre} — ${sesion.motivos[idx]}`).join("\n");
+  await borrarSesion(chatId);
+  await enviarMensaje(chatId, `✅ Faltas registradas:\n\n${resumen}`);
+  await menuTurno(chatId, jefe);
 }
 
 // ============ /exportar y /resumen ============
@@ -270,6 +328,7 @@ exports.handler = async (event) => {
       else if (data === "turno_iniciar_tarde") await iniciarTurno(chatId, jefe, "tarde", cq.id, messageId);
       else if (data === "turno_iniciar_noche") await iniciarTurno(chatId, jefe, "noche", cq.id, messageId);
       else if (data === "turno_faltas") await iniciarFaltas(chatId, jefe, cq.id, messageId);
+      else if (data.startsWith("motivo_")) await recibirMotivoBoton(chatId, jefe, data, cq.id);
       else if (data === "turno_finalizar") await pedirConfirmacionCierre(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_si") await finalizarTurno(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_no") { await responderCallback(cq.id, "Turno sigue abierto"); await menuTurno(chatId, jefe, messageId); }
@@ -328,38 +387,18 @@ exports.handler = async (event) => {
         const invalidos = numeros.filter((n) => n < 1 || n > els.length);
         if (invalidos.length) { await enviarMensaje(chatId, `Fuera de rango: ${invalidos.join(", ")}. Válidos: 1 a ${els.length}.`); return { statusCode: 200, body: "ok" }; }
         const seleccion = [...new Set(numeros.map((n) => n - 1))].sort((a, b) => a - b);
-        // Pedimos el motivo del primero
         await guardarSesion(chatId, { ...sesion, seleccion, pendientes_motivo: seleccion.slice(), motivos: {}, paso: "motivo" });
-        await enviarMensaje(chatId, `Vas a registrar ${seleccion.length} falta(s).\n\nMotivo de <b>${els[seleccion[0]].nombre}</b>:\n<i>(escribe el motivo: enfermedad, permiso, sin avisar, etc.)</i>`);
+        await enviarMensaje(chatId, `Vas a registrar ${seleccion.length} falta(s). Elige el motivo de cada uno:`);
+        await pedirMotivo(chatId, { ...sesion, pendientes_motivo: seleccion.slice() }, els);
         return { statusCode: 200, body: "ok" };
       }
 
-      if (sesion.paso === "motivo") {
-        const pendientes = sesion.pendientes_motivo || [];
-        const actual = pendientes[0];
+      // Al paso "motivo" solo llegamos por texto si el jefe eligió "Otro"
+      if (sesion.paso === "esperando_motivo_otro") {
+        const idx = (sesion.pendientes_motivo || [])[0];
         const motivos = sesion.motivos || {};
-        motivos[actual] = bruto; // el motivo tal cual lo escribió
-        const restantes = pendientes.slice(1);
-
-        if (restantes.length) {
-          await guardarSesion(chatId, { ...sesion, motivos, pendientes_motivo: restantes });
-          await enviarMensaje(chatId, `Motivo de <b>${els[restantes[0]].nombre}</b>:`);
-          return { statusCode: 200, body: "ok" };
-        }
-
-        // Ya no quedan: guardar todas las faltas como eventos
-        for (const idx of (sesion.seleccion || [])) {
-          const el = els[idx];
-          await crearDoc("eventos", {
-            tipo: "falta", turno_id: sesion.turno_id, instalacion: sesion.instalacion,
-            clave: el.clave, nombre: el.nombre, motivo: motivos[idx] || "",
-            reportado_por: jefe.nombre, fecha: hoyISO(), creado_en: new Date().toISOString(), exportado: false,
-          });
-        }
-        const resumen = (sesion.seleccion || []).map((idx) => `• ${els[idx].nombre} — ${motivos[idx]}`).join("\n");
-        await borrarSesion(chatId);
-        await enviarMensaje(chatId, `✅ Faltas registradas:\n\n${resumen}`);
-        await menuTurno(chatId, jefe);
+        motivos[idx] = bruto; // texto libre
+        await avanzarMotivo(chatId, jefe, { ...sesion, motivos, paso: "motivo" }, els);
         return { statusCode: 200, body: "ok" };
       }
     }
