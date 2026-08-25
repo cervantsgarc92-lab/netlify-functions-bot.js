@@ -1,4 +1,5 @@
 // netlify/functions/bot.js
+// Bot v11: corrige el guardado de motivos (ya no usa índices como llaves de objeto).
 // Bot v10: faltas con botones de motivo (Incapacitado / No avisó / Permiso / Otro)
 // Bot v9:
 //   - Todo lo de v8 (resguardo, /resumen, /exportar, /turno con iniciar/entregar)
@@ -226,7 +227,7 @@ async function iniciarFaltas(chatId, jefe, callbackId, messageId) {
   const abierto = await turnoAbierto(jefe.instalacion);
   if (!abierto) { await responderCallback(callbackId, "No hay turno abierto"); return; }
   const els = await elementosDe(jefe.instalacion);
-  await guardarSesion(chatId, { flujo: "faltas", turno_id: abierto.id, instalacion: jefe.instalacion, paso: "seleccionando_faltas", seleccion: [], pendientes_motivo: [], motivos: {} });
+  await guardarSesion(chatId, { flujo: "faltas", turno_id: abierto.id, instalacion: jefe.instalacion, paso: "seleccionando_faltas" });
   await responderCallback(callbackId);
   const lista = els.map((e, i) => `${i + 1}. ${e.nombre}`).join("\n");
   await editarMensaje(chatId, messageId,
@@ -234,50 +235,51 @@ async function iniciarFaltas(chatId, jefe, callbackId, messageId) {
     `<i>Escribe los números de quienes faltaron (ej: <code>2 5</code>).\nSi no faltó nadie, escribe <code>ninguno</code>.</i>`);
 }
 
-// Pide el motivo del siguiente pendiente, con botones
-async function pedirMotivo(chatId, sesion, els) {
-  const idx = (sesion.pendientes_motivo || [])[0];
-  await enviarMensaje(chatId, `Motivo de la falta de <b>${els[idx].nombre}</b>:`, { reply_markup: tecladoMotivo });
+// Pide el motivo de la falta en la posición actual (sesion.pos), con botones
+async function pedirMotivo(chatId, sesion) {
+  const f = sesion.faltas[sesion.pos];
+  await enviarMensaje(chatId, `Motivo de la falta de <b>${f.nombre}</b>:`, { reply_markup: tecladoMotivo });
 }
 
 // Recibe el motivo elegido por botón
 async function recibirMotivoBoton(chatId, jefe, data, callbackId) {
   const sesion = await leerSesion(chatId);
   if (!sesion || sesion.flujo !== "faltas" || sesion.paso !== "motivo") { await responderCallback(callbackId); return; }
-  const els = await elementosDe(sesion.instalacion);
   const clave = data.replace("motivo_", "");
-  const idx = sesion.pendientes_motivo[0];
 
   if (clave === "otro") {
     await responderCallback(callbackId);
     await guardarSesion(chatId, { ...sesion, paso: "esperando_motivo_otro" });
-    await enviarMensaje(chatId, `Escribe el motivo de <b>${els[idx].nombre}</b>:`);
+    await enviarMensaje(chatId, `Escribe el motivo de <b>${sesion.faltas[sesion.pos].nombre}</b>:`);
     return;
   }
 
-  const motivos = sesion.motivos || {};
-  motivos[idx] = ETIQUETA_MOTIVO[clave] || clave;
+  const faltas = sesion.faltas.slice();
+  faltas[sesion.pos] = { ...faltas[sesion.pos], motivo: ETIQUETA_MOTIVO[clave] || clave };
   await responderCallback(callbackId, ETIQUETA_MOTIVO[clave]);
-  await avanzarMotivo(chatId, jefe, { ...sesion, motivos }, els);
+  await avanzarMotivo(chatId, jefe, { ...sesion, faltas });
 }
 
-// Avanza al siguiente pendiente o guarda todo si ya no quedan
-async function avanzarMotivo(chatId, jefe, sesion, els) {
-  const restantes = (sesion.pendientes_motivo || []).slice(1);
-  if (restantes.length) {
-    await guardarSesion(chatId, { ...sesion, pendientes_motivo: restantes, paso: "motivo" });
-    await pedirMotivo(chatId, { ...sesion, pendientes_motivo: restantes }, els);
+// Avanza a la siguiente falta o guarda todo si ya no quedan
+async function avanzarMotivo(chatId, jefe, sesion) {
+  const siguiente = sesion.pos + 1;
+
+  if (siguiente < sesion.faltas.length) {
+    const nueva = { ...sesion, pos: siguiente, paso: "motivo" };
+    await guardarSesion(chatId, nueva);
+    await pedirMotivo(chatId, nueva);
     return;
   }
-  for (const idx of (sesion.seleccion || [])) {
-    const el = els[idx];
+
+  // Ya están todas con su motivo: guardar en eventos
+  for (const f of sesion.faltas) {
     await crearDoc("eventos", {
       tipo: "falta", turno_id: sesion.turno_id, instalacion: sesion.instalacion,
-      clave: el.clave, nombre: el.nombre, motivo: sesion.motivos[idx] || "",
+      clave: f.clave, nombre: f.nombre, motivo: f.motivo || "",
       reportado_por: jefe.nombre, fecha: hoyISO(), creado_en: new Date().toISOString(), exportado: false,
     });
   }
-  const resumen = (sesion.seleccion || []).map((idx) => `• ${els[idx].nombre} — ${sesion.motivos[idx]}`).join("\n");
+  const resumen = sesion.faltas.map((f) => `• ${f.nombre} — ${f.motivo}`).join("\n");
   await borrarSesion(chatId);
   await enviarMensaje(chatId, `✅ Faltas registradas:\n\n${resumen}`);
   await menuTurno(chatId, jefe);
@@ -386,19 +388,21 @@ exports.handler = async (event) => {
         if (!numeros.length) { await enviarMensaje(chatId, "Escribe números (ej: <code>2 5</code>) o <code>ninguno</code>."); return { statusCode: 200, body: "ok" }; }
         const invalidos = numeros.filter((n) => n < 1 || n > els.length);
         if (invalidos.length) { await enviarMensaje(chatId, `Fuera de rango: ${invalidos.join(", ")}. Válidos: 1 a ${els.length}.`); return { statusCode: 200, body: "ok" }; }
-        const seleccion = [...new Set(numeros.map((n) => n - 1))].sort((a, b) => a - b);
-        await guardarSesion(chatId, { ...sesion, seleccion, pendientes_motivo: seleccion.slice(), motivos: {}, paso: "motivo" });
-        await enviarMensaje(chatId, `Vas a registrar ${seleccion.length} falta(s). Elige el motivo de cada uno:`);
-        await pedirMotivo(chatId, { ...sesion, pendientes_motivo: seleccion.slice() }, els);
+        // Construir lista de faltas con clave y nombre reales (sin índices como llaves)
+        const indices = [...new Set(numeros.map((n) => n - 1))].sort((a, b) => a - b);
+        const faltas = indices.map((i) => ({ clave: els[i].clave, nombre: els[i].nombre, motivo: "" }));
+        const nueva = { ...sesion, faltas, pos: 0, paso: "motivo" };
+        await guardarSesion(chatId, nueva);
+        await enviarMensaje(chatId, `Vas a registrar ${faltas.length} falta(s). Elige el motivo de cada uno:`);
+        await pedirMotivo(chatId, nueva);
         return { statusCode: 200, body: "ok" };
       }
 
-      // Al paso "motivo" solo llegamos por texto si el jefe eligió "Otro"
+      // Al paso motivo por texto solo se llega si eligió "Otro"
       if (sesion.paso === "esperando_motivo_otro") {
-        const idx = (sesion.pendientes_motivo || [])[0];
-        const motivos = sesion.motivos || {};
-        motivos[idx] = bruto; // texto libre
-        await avanzarMotivo(chatId, jefe, { ...sesion, motivos, paso: "motivo" }, els);
+        const faltas = sesion.faltas.slice();
+        faltas[sesion.pos] = { ...faltas[sesion.pos], motivo: bruto };
+        await avanzarMotivo(chatId, jefe, { ...sesion, faltas, paso: "motivo" });
         return { statusCode: 200, body: "ok" };
       }
     }
