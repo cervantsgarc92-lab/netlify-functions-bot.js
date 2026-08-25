@@ -1,4 +1,7 @@
 // netlify/functions/bot.js
+// Bot v12: corrige clave/nombre "undefined" en faltas.
+// La sesión guarda solo índices (números) y motivos (strings) — arrays simples que
+// Firestore sí serializa. Clave y nombre se sacan de `elementos` fresco al guardar.
 // Bot v11: corrige el guardado de motivos (ya no usa índices como llaves de objeto).
 // Bot v10: faltas con botones de motivo (Incapacitado / No avisó / Permiso / Otro)
 // Bot v9:
@@ -235,53 +238,59 @@ async function iniciarFaltas(chatId, jefe, callbackId, messageId) {
     `<i>Escribe los números de quienes faltaron (ej: <code>2 5</code>).\nSi no faltó nadie, escribe <code>ninguno</code>.</i>`);
 }
 
-// Pide el motivo de la falta en la posición actual (sesion.pos), con botones
-async function pedirMotivo(chatId, sesion) {
-  const f = sesion.faltas[sesion.pos];
-  await enviarMensaje(chatId, `Motivo de la falta de <b>${f.nombre}</b>:`, { reply_markup: tecladoMotivo });
+// Pide el motivo de la falta en la posición actual (sesion.pos), con botones.
+// El nombre se saca de `els` (fresco), no de la sesión.
+async function pedirMotivo(chatId, sesion, els) {
+  const idx = sesion.indices[sesion.pos];
+  await enviarMensaje(chatId, `Motivo de la falta de <b>${els[idx].nombre}</b>:`, { reply_markup: tecladoMotivo });
 }
 
 // Recibe el motivo elegido por botón
 async function recibirMotivoBoton(chatId, jefe, data, callbackId) {
   const sesion = await leerSesion(chatId);
   if (!sesion || sesion.flujo !== "faltas" || sesion.paso !== "motivo") { await responderCallback(callbackId); return; }
+  const els = await elementosDe(sesion.instalacion);
   const clave = data.replace("motivo_", "");
 
   if (clave === "otro") {
     await responderCallback(callbackId);
     await guardarSesion(chatId, { ...sesion, paso: "esperando_motivo_otro" });
-    await enviarMensaje(chatId, `Escribe el motivo de <b>${sesion.faltas[sesion.pos].nombre}</b>:`);
+    const idx = sesion.indices[sesion.pos];
+    await enviarMensaje(chatId, `Escribe el motivo de <b>${els[idx].nombre}</b>:`);
     return;
   }
 
-  const faltas = sesion.faltas.slice();
-  faltas[sesion.pos] = { ...faltas[sesion.pos], motivo: ETIQUETA_MOTIVO[clave] || clave };
+  const motivos = (sesion.motivos || []).slice();
+  motivos[sesion.pos] = ETIQUETA_MOTIVO[clave] || clave;
   await responderCallback(callbackId, ETIQUETA_MOTIVO[clave]);
-  await avanzarMotivo(chatId, jefe, { ...sesion, faltas });
+  await avanzarMotivo(chatId, jefe, { ...sesion, motivos }, els);
 }
 
 // Avanza a la siguiente falta o guarda todo si ya no quedan
-async function avanzarMotivo(chatId, jefe, sesion) {
+async function avanzarMotivo(chatId, jefe, sesion, els) {
   const siguiente = sesion.pos + 1;
 
-  if (siguiente < sesion.faltas.length) {
+  if (siguiente < sesion.indices.length) {
     const nueva = { ...sesion, pos: siguiente, paso: "motivo" };
     await guardarSesion(chatId, nueva);
-    await pedirMotivo(chatId, nueva);
+    await pedirMotivo(chatId, nueva, els);
     return;
   }
 
-  // Ya están todas con su motivo: guardar en eventos
-  for (const f of sesion.faltas) {
+  // Guardar cada falta, sacando clave y nombre de `els` fresco por su índice
+  const resumenLineas = [];
+  for (let i = 0; i < sesion.indices.length; i++) {
+    const el = els[sesion.indices[i]];
+    const motivo = (sesion.motivos || [])[i] || "";
     await crearDoc("eventos", {
       tipo: "falta", turno_id: sesion.turno_id, instalacion: sesion.instalacion,
-      clave: f.clave, nombre: f.nombre, motivo: f.motivo || "",
+      clave: el.clave, nombre: el.nombre, motivo,
       reportado_por: jefe.nombre, fecha: hoyISO(), creado_en: new Date().toISOString(), exportado: false,
     });
+    resumenLineas.push(`• ${el.nombre} — ${motivo}`);
   }
-  const resumen = sesion.faltas.map((f) => `• ${f.nombre} — ${f.motivo}`).join("\n");
   await borrarSesion(chatId);
-  await enviarMensaje(chatId, `✅ Faltas registradas:\n\n${resumen}`);
+  await enviarMensaje(chatId, `✅ Faltas registradas:\n\n${resumenLineas.join("\n")}`);
   await menuTurno(chatId, jefe);
 }
 
@@ -388,21 +397,20 @@ exports.handler = async (event) => {
         if (!numeros.length) { await enviarMensaje(chatId, "Escribe números (ej: <code>2 5</code>) o <code>ninguno</code>."); return { statusCode: 200, body: "ok" }; }
         const invalidos = numeros.filter((n) => n < 1 || n > els.length);
         if (invalidos.length) { await enviarMensaje(chatId, `Fuera de rango: ${invalidos.join(", ")}. Válidos: 1 a ${els.length}.`); return { statusCode: 200, body: "ok" }; }
-        // Construir lista de faltas con clave y nombre reales (sin índices como llaves)
+        // Guardar SOLO índices (números) y un array de motivos vacío — arrays simples que Firestore serializa bien
         const indices = [...new Set(numeros.map((n) => n - 1))].sort((a, b) => a - b);
-        const faltas = indices.map((i) => ({ clave: els[i].clave, nombre: els[i].nombre, motivo: "" }));
-        const nueva = { ...sesion, faltas, pos: 0, paso: "motivo" };
+        const nueva = { ...sesion, indices, motivos: [], pos: 0, paso: "motivo" };
         await guardarSesion(chatId, nueva);
-        await enviarMensaje(chatId, `Vas a registrar ${faltas.length} falta(s). Elige el motivo de cada uno:`);
-        await pedirMotivo(chatId, nueva);
+        await enviarMensaje(chatId, `Vas a registrar ${indices.length} falta(s). Elige el motivo de cada uno:`);
+        await pedirMotivo(chatId, nueva, els);
         return { statusCode: 200, body: "ok" };
       }
 
       // Al paso motivo por texto solo se llega si eligió "Otro"
       if (sesion.paso === "esperando_motivo_otro") {
-        const faltas = sesion.faltas.slice();
-        faltas[sesion.pos] = { ...faltas[sesion.pos], motivo: bruto };
-        await avanzarMotivo(chatId, jefe, { ...sesion, faltas, paso: "motivo" });
+        const motivos = (sesion.motivos || []).slice();
+        motivos[sesion.pos] = bruto;
+        await avanzarMotivo(chatId, jefe, { ...sesion, motivos, paso: "motivo" }, els);
         return { statusCode: 200, body: "ok" };
       }
     }
