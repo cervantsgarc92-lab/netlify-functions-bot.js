@@ -779,6 +779,8 @@ exports.handler = async (event) => {
 
     if (!jefe && !esCoordinador(telegramId)) { await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín."); return { statusCode: 200, body: "ok" }; }
 
+    const sesionCoord = await leerSesion(chatId);
+
     // Flujo de reporte de fallas (coordinador): capturar rango
     if (sesionCoord && sesionCoord.flujo === "falla_reporte") {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
@@ -814,7 +816,6 @@ exports.handler = async (event) => {
     }
 
     // Flujo de reporte de faltas (coordinador): capturar rango de fechas
-    const sesionCoord = await leerSesion(chatId);
     if (sesionCoord && sesionCoord.flujo === "faltas_reporte") {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
       if (sesionCoord.paso === "faltas_desde") {
