@@ -1,4 +1,6 @@
 // netlify/functions/bot.js
+// Bot v14: Incidentes (categoría grupo->tipo + descripción), nacen abiertos,
+// se heredan turno tras turno; el jefe que hereda los cierra.
 // Bot v13: agrega /faltas (solo coordinador) — reporte por rango de fechas,
 // resumen en chat + CSV, marca lo exportado.
 // Bot v12: corrige clave/nombre "undefined" en faltas.
@@ -143,6 +145,8 @@ const tecladoIniciar = { inline_keyboard: [
 // Menú del turno en curso: ahora con Faltas
 const tecladoEnCurso = { inline_keyboard: [
   [{ text: "👤 Registrar faltas", callback_data: "turno_faltas" }],
+  [{ text: "⚠️ Registrar incidente", callback_data: "turno_incidente" }],
+  [{ text: "📋 Incidentes pendientes", callback_data: "turno_pendientes" }],
   [{ text: "✅ Entregar reporte del turno", callback_data: "turno_finalizar" }],
 ] };
 
@@ -160,14 +164,41 @@ const tecladoMotivo = { inline_keyboard: [
 
 const ETIQUETA_MOTIVO = { incapacitado: "Incapacitado", no_aviso: "No avisó", permiso: "Permiso" };
 
+// ---- Categorías de incidente (grupo -> tipos) ----
+const CATEGORIAS_INCIDENTE = {
+  social: { nombre: "Problemática social", tipos: {
+    conflicto: "Conflicto familiar o vecinal", consumo: "Consumo de alcohol o drogas", otro: "Otro",
+  } },
+  administrativa: { nombre: "Falta administrativa", tipos: {
+    orden: "Alteración del orden", agresion: "Agresión física", otro: "Otro",
+  } },
+  delito: { nombre: "Delito", tipos: {
+    robo: "Robo", lesiones: "Lesiones", otro: "Otro",
+  } },
+};
+
+const tecladoGrupoIncidente = { inline_keyboard: [
+  [{ text: "🟡 Problemática social", callback_data: "inc_grupo_social" }],
+  [{ text: "🟠 Falta administrativa", callback_data: "inc_grupo_administrativa" }],
+  [{ text: "🔴 Delito", callback_data: "inc_grupo_delito" }],
+] };
+
+function tecladoTipoIncidente(grupo) {
+  const tipos = CATEGORIAS_INCIDENTE[grupo].tipos;
+  return { inline_keyboard: Object.entries(tipos).map(([k, v]) => [{ text: v, callback_data: `inc_tipo_${grupo}_${k}` }]) };
+}
+
 async function menuTurno(chatId, jefe, messageIdParaEditar = null) {
   const abierto = await turnoAbierto(jefe.instalacion);
   if (abierto) {
-    // Contar faltas ya registradas en este turno
+    // Contar faltas de este turno e incidentes pendientes de la instalación
     const faltas = await consultar("eventos", "turno_id", abierto.id);
     const nFaltas = faltas.filter((e) => e.tipo === "falta").length;
+    const nPend = (await incidentesAbiertos(jefe.instalacion)).length;
+    const contadores = (nFaltas ? `Faltas registradas: <b>${nFaltas}</b>\n` : "") +
+      (nPend ? `⚠️ Incidentes pendientes: <b>${nPend}</b>\n` : "");
     const texto = `<b>${jefe.instalacion.toUpperCase()}</b> · Turno <b>${NOMBRE_TURNO[abierto.turno]}</b> en curso\n${fechaBonita(abierto.fecha)}\n\n` +
-      (nFaltas ? `Faltas registradas: <b>${nFaltas}</b>\n\n` : "") + `¿Qué deseas hacer?`;
+      (contadores ? contadores + "\n" : "") + `¿Qué deseas hacer?`;
     if (messageIdParaEditar) await editarMensaje(chatId, messageIdParaEditar, texto, { reply_markup: tecladoEnCurso });
     else await enviarMensaje(chatId, texto, { reply_markup: tecladoEnCurso });
   } else {
@@ -200,7 +231,11 @@ async function iniciarTurno(chatId, jefe, turno, callbackId, messageId) {
   }
   await escribirDoc("turnos", id, { instalacion: jefe.instalacion, fecha, turno, estado: "abierto", jefe_abrio: jefe.nombre, abierto_en: new Date().toISOString() });
   await responderCallback(callbackId, "Turno iniciado");
-  await editarMensaje(chatId, messageId, `✅ Turno <b>${NOMBRE_TURNO[turno]}</b> iniciado\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCurso });
+  const pend = await incidentesAbiertos(jefe.instalacion);
+  const avisoPend = pend.length
+    ? `\n\n⚠️ <b>${pend.length} incidente(s) pendiente(s)</b> del turno anterior. Revísalos en "Incidentes pendientes".`
+    : "";
+  await editarMensaje(chatId, messageId, `✅ Turno <b>${NOMBRE_TURNO[turno]}</b> iniciado\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}${avisoPend}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCurso });
 }
 
 async function pedirConfirmacionCierre(chatId, jefe, callbackId, messageId) {
@@ -296,6 +331,86 @@ async function avanzarMotivo(chatId, jefe, sesion, els) {
   await menuTurno(chatId, jefe);
 }
 
+// ---- Incidentes ----
+
+// Trae los incidentes abiertos de una instalación
+async function incidentesAbiertos(instalacion) {
+  return await consultar2("eventos_inc", "instalacion", instalacion, "estado", "abierto");
+}
+
+// Inicia el registro de un incidente: elegir grupo
+async function iniciarIncidente(chatId, jefe, callbackId, messageId) {
+  const abierto = await turnoAbierto(jefe.instalacion);
+  if (!abierto) { await responderCallback(callbackId, "No hay turno abierto"); return; }
+  await guardarSesion(chatId, { flujo: "incidente", turno_id: abierto.id, instalacion: jefe.instalacion, paso: "grupo" });
+  await responderCallback(callbackId);
+  await editarMensaje(chatId, messageId, `<b>Registrar incidente</b>\n\n¿Qué tipo de incidente?`, { reply_markup: tecladoGrupoIncidente });
+}
+
+// Recibe el grupo elegido -> muestra tipos
+async function incidenteGrupo(chatId, jefe, grupo, callbackId, messageId) {
+  const sesion = await leerSesion(chatId);
+  if (!sesion || sesion.flujo !== "incidente") { await responderCallback(callbackId); return; }
+  await guardarSesion(chatId, { ...sesion, grupo, paso: "tipo" });
+  await responderCallback(callbackId);
+  await editarMensaje(chatId, messageId, `<b>${CATEGORIAS_INCIDENTE[grupo].nombre}</b>\n\n¿Qué específicamente?`, { reply_markup: tecladoTipoIncidente(grupo) });
+}
+
+// Recibe el tipo -> pide descripción
+async function incidenteTipo(chatId, jefe, grupo, tipo, callbackId, messageId) {
+  const sesion = await leerSesion(chatId);
+  if (!sesion || sesion.flujo !== "incidente") { await responderCallback(callbackId); return; }
+  await guardarSesion(chatId, { ...sesion, grupo, tipo, paso: "descripcion" });
+  await responderCallback(callbackId);
+  const nombreTipo = CATEGORIAS_INCIDENTE[grupo].tipos[tipo];
+  await editarMensaje(chatId, messageId, `<b>${CATEGORIAS_INCIDENTE[grupo].nombre} · ${nombreTipo}</b>\n\nDescribe qué pasó:`);
+}
+
+// Guarda el incidente (nace abierto)
+async function guardarIncidente(chatId, jefe, descripcion) {
+  const sesion = await leerSesion(chatId);
+  if (!sesion || sesion.flujo !== "incidente") return;
+  const grupoNombre = CATEGORIAS_INCIDENTE[sesion.grupo].nombre;
+  const tipoNombre = CATEGORIAS_INCIDENTE[sesion.grupo].tipos[sesion.tipo];
+  await crearDoc("eventos_inc", {
+    instalacion: sesion.instalacion, turno_id_origen: sesion.turno_id,
+    grupo: grupoNombre, tipo: tipoNombre, descripcion,
+    estado: "abierto", reportado_por: jefe.nombre,
+    fecha: hoyISO(), creado_en: new Date().toISOString(),
+  });
+  await borrarSesion(chatId);
+  await enviarMensaje(chatId, `✅ Incidente registrado (queda <b>abierto</b>):\n\n<b>${grupoNombre} · ${tipoNombre}</b>\n${descripcion}`);
+  await menuTurno(chatId, jefe);
+}
+
+// Muestra los incidentes pendientes con botón para cerrar cada uno
+async function verPendientes(chatId, jefe, callbackId, messageId) {
+  const abiertos = await incidentesAbiertos(jefe.instalacion);
+  if (callbackId) await responderCallback(callbackId);
+  if (!abiertos.length) {
+    const texto = `<b>${jefe.instalacion.toUpperCase()}</b>\n\nNo hay incidentes pendientes. 👍`;
+    if (messageId) await editarMensaje(chatId, messageId, texto, { reply_markup: tecladoEnCurso });
+    else await enviarMensaje(chatId, texto);
+    return;
+  }
+  let texto = `<b>Incidentes pendientes</b> · ${jefe.instalacion.toUpperCase()}\n\n`;
+  const botones = [];
+  abiertos.forEach((inc, i) => {
+    texto += `${i + 1}. <b>${inc.grupo} · ${inc.tipo}</b>\n${inc.descripcion}\n<i>Desde ${fechaBonita(inc.fecha)}, reportó ${inc.reportado_por}</i>\n\n`;
+    botones.push([{ text: `✅ Cerrar #${i + 1}`, callback_data: `inc_cerrar_${inc.id}` }]);
+  });
+  botones.push([{ text: "« Volver", callback_data: "turno_volver" }]);
+  if (messageId) await editarMensaje(chatId, messageId, texto, { reply_markup: { inline_keyboard: botones } });
+  else await enviarMensaje(chatId, texto, { reply_markup: { inline_keyboard: botones } });
+}
+
+// Cierra un incidente por su id
+async function cerrarIncidente(chatId, jefe, incId, callbackId, messageId) {
+  await escribirDoc("eventos_inc", incId, { estado: "cerrado", cerrado_por: jefe.nombre, cerrado_en: new Date().toISOString() });
+  await responderCallback(callbackId, "Incidente cerrado");
+  await verPendientes(chatId, jefe, null, messageId);
+}
+
 // ============ /exportar y /resumen ============
 
 async function exportar(chatId) {
@@ -374,6 +489,12 @@ exports.handler = async (event) => {
       else if (data === "turno_iniciar_noche") await iniciarTurno(chatId, jefe, "noche", cq.id, messageId);
       else if (data === "turno_faltas") await iniciarFaltas(chatId, jefe, cq.id, messageId);
       else if (data.startsWith("motivo_")) await recibirMotivoBoton(chatId, jefe, data, cq.id);
+      else if (data === "turno_incidente") await iniciarIncidente(chatId, jefe, cq.id, messageId);
+      else if (data.startsWith("inc_grupo_")) await incidenteGrupo(chatId, jefe, data.replace("inc_grupo_", ""), cq.id, messageId);
+      else if (data.startsWith("inc_tipo_")) { const p = data.replace("inc_tipo_", "").split("_"); await incidenteTipo(chatId, jefe, p[0], p[1], cq.id, messageId); }
+      else if (data === "turno_pendientes") await verPendientes(chatId, jefe, cq.id, messageId);
+      else if (data.startsWith("inc_cerrar_")) await cerrarIncidente(chatId, jefe, data.replace("inc_cerrar_", ""), cq.id, messageId);
+      else if (data === "turno_volver") { await responderCallback(cq.id); await menuTurno(chatId, jefe, messageId); }
       else if (data === "turno_finalizar") await pedirConfirmacionCierre(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_si") await finalizarTurno(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_no") { await responderCallback(cq.id, "Turno sigue abierto"); await menuTurno(chatId, jefe, messageId); }
@@ -444,6 +565,13 @@ exports.handler = async (event) => {
 
     const sesion = await leerSesion(chatId);
     if (!sesion || !sesion.paso) { await enviarMensaje(chatId, "Usa /turno o /resguardo para comenzar."); return { statusCode: 200, body: "ok" }; }
+
+    // ===== Flujo de INCIDENTE (descripción por texto) =====
+    if (sesion.flujo === "incidente" && sesion.paso === "descripcion") {
+      if (bruto.length < 3) { await enviarMensaje(chatId, "Escribe una descripción un poco más completa."); return { statusCode: 200, body: "ok" }; }
+      await guardarIncidente(chatId, jefe, bruto);
+      return { statusCode: 200, body: "ok" };
+    }
 
     // ===== Flujo de FALTAS =====
     if (sesion.flujo === "faltas") {
