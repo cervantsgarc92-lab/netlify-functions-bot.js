@@ -1,4 +1,6 @@
 // netlify/functions/bot.js
+// Bot v16: /incidentes (coordinador) — elige estado (todos/abiertos/cerrados),
+// rango de fechas, devuelve resumen + CSV.
 // Bot v14: Incidentes (categoría grupo->tipo + descripción), nacen abiertos,
 // se heredan turno tras turno; el jefe que hereda los cierra.
 // Bot v13: agrega /faltas (solo coordinador) — reporte por rango de fechas,
@@ -102,6 +104,20 @@ async function crearDoc(coleccion, obj) {
   return res.ok;
 }
 async function borrarDoc(coleccion, id) { await fetch(`${FS}/${coleccion}/${id}?key=${API_KEY}`, { method: "DELETE" }); }
+
+// Trae todos los documentos de una colección (paginado)
+async function listar(coleccion) {
+  const salida = []; let pageToken = "";
+  do {
+    const url = `${FS}/${coleccion}?key=${API_KEY}&pageSize=300${pageToken ? `&pageToken=${pageToken}` : ""}`;
+    const res = await fetch(url);
+    if (!res.ok) { console.error(`listar falló (${coleccion}):`, res.status); break; }
+    const data = await res.json();
+    (data.documents || []).forEach((d) => salida.push({ id: d.name.split("/").pop(), ...planos(d.fields) }));
+    pageToken = data.nextPageToken || "";
+  } while (pageToken);
+  return salida;
+}
 
 // ============ Dominio ============
 
@@ -489,6 +505,47 @@ async function reporteFaltas(chatId, desde, hasta) {
   await enviarDocumento(chatId, `faltas_${desde}_a_${hasta}.csv`, csv, "Faltas para RH");
 }
 
+// Reporte de incidentes por rango y estado: resumen en chat + CSV
+async function reporteIncidentes(chatId, estado, desde, hasta) {
+  const inc = (await listar("eventos_inc"))
+    .filter((x) => x.fecha >= desde && x.fecha <= hasta)
+    .filter((x) => estado === "todos" ? true : x.estado === estado)
+    .sort((a, b) => (a.fecha + a.instalacion).localeCompare(b.fecha + b.instalacion, "es"));
+
+  const etiquetaEstado = { todos: "Todos", abierto: "Abiertos", cerrado: "Cerrados" }[estado];
+
+  if (!inc.length) {
+    await enviarMensaje(chatId, `No hay incidentes (${etiquetaEstado.toLowerCase()}) entre ${fechaBonita(desde)} y ${fechaBonita(hasta)}.`);
+    return;
+  }
+
+  // Resumen agrupado por instalación
+  const porInst = {};
+  inc.forEach((x) => { (porInst[x.instalacion] = porInst[x.instalacion] || []).push(x); });
+  let msg = `<b>Incidentes · ${etiquetaEstado}</b>\n${fechaBonita(desde)} a ${fechaBonita(hasta)}\n\n`;
+  for (const instk of Object.keys(porInst).sort()) {
+    msg += `<b>${instk.toUpperCase()}</b>\n`;
+    porInst[instk].forEach((x) => {
+      const marca = x.estado === "abierto" ? "🔴" : "✅";
+      msg += `${marca} ${x.grupo} · ${x.tipo}\n   ${x.descripcion}\n   <i>${fechaBonita(x.fecha)}, ${x.reportado_por}${x.estado === "cerrado" && x.cerrado_por ? ` — cerró ${x.cerrado_por}` : ""}</i>\n`;
+    });
+    msg += "\n";
+  }
+  msg += `Total: <b>${inc.length}</b> incidente(s).`;
+  // Telegram limita mensajes a ~4096 chars; si es largo, mandamos aviso y solo CSV
+  if (msg.length > 3800) {
+    await enviarMensaje(chatId, `<b>Incidentes · ${etiquetaEstado}</b>\n${fechaBonita(desde)} a ${fechaBonita(hasta)}\n\nSon <b>${inc.length}</b> incidentes, demasiados para mostrar aquí. Te mando el CSV con el detalle.`);
+  } else {
+    await enviarMensaje(chatId, msg);
+  }
+
+  const csv = [
+    ["FECHA", "INSTALACION", "GRUPO", "TIPO", "DESCRIPCION", "ESTADO", "REPORTO", "CERRO"].join(","),
+    ...inc.map((x) => [x.fecha, x.instalacion, x.grupo, x.tipo, x.descripcion, x.estado, x.reportado_por, x.cerrado_por || ""].map(csvCampo).join(",")),
+  ].join("\r\n");
+  await enviarDocumento(chatId, `incidentes_${estado}_${desde}_a_${hasta}.csv`, csv, "Incidentes");
+}
+
 // ============ Handler ============
 
 exports.handler = async (event) => {
@@ -502,6 +559,16 @@ exports.handler = async (event) => {
     const cq = update.callback_query;
     const chatId = cq.message.chat.id, messageId = cq.message.message_id, telegramId = cq.from.id, data = cq.data || "";
     try {
+      // Botones de reporte de incidentes (coordinador) — antes del guard de jefe
+      if (data.startsWith("rep_inc_")) {
+        if (!esCoordinador(telegramId)) { await responderCallback(cq.id, "Solo coordinador"); return { statusCode: 200, body: "ok" }; }
+        const estado = data.replace("rep_inc_", ""); // todos | abierto | cerrado
+        await guardarSesion(chatId, { flujo: "inc_reporte", estado, paso: "inc_desde" });
+        await responderCallback(cq.id);
+        await editarMensaje(chatId, messageId, `<b>Reporte de incidentes</b>\n\nEscribe la fecha <b>desde</b> (<code>AAAA-MM-DD</code>). Ej: <code>2026-08-01</code>`);
+        return { statusCode: 200, body: "ok" };
+      }
+
       const jefe = await buscarJefe(telegramId);
       if (!jefe) { await responderCallback(cq.id, "No estás dado de alta"); return { statusCode: 200, body: "ok" }; }
       if (data === "turno_iniciar_manana") await iniciarTurno(chatId, jefe, "manana", cq.id, messageId);
@@ -548,7 +615,34 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: "ok" };
     }
 
+    if (texto.startsWith("/incidentes")) {
+      if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; }
+      await enviarMensaje(chatId, "<b>Reporte de incidentes</b>\n\n¿Cuáles quieres ver?", { reply_markup: { inline_keyboard: [
+        [{ text: "Todos", callback_data: "rep_inc_todos" }],
+        [{ text: "🔴 Solo abiertos", callback_data: "rep_inc_abierto" }],
+        [{ text: "✅ Solo cerrados", callback_data: "rep_inc_cerrado" }],
+      ] } });
+      return { statusCode: 200, body: "ok" };
+    }
+
     if (!jefe && !esCoordinador(telegramId)) { await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín."); return { statusCode: 200, body: "ok" }; }
+
+    // Flujo de reporte de incidentes (coordinador): capturar rango
+    if (sesionCoord && sesionCoord.flujo === "inc_reporte") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
+      if (sesionCoord.paso === "inc_desde") {
+        await guardarSesion(chatId, { ...sesionCoord, desde: bruto, paso: "inc_hasta" });
+        await enviarMensaje(chatId, `Desde: <b>${fechaBonita(bruto)}</b>\n\nAhora la fecha <b>hasta</b> (<code>AAAA-MM-DD</code>).`);
+        return { statusCode: 200, body: "ok" };
+      }
+      if (sesionCoord.paso === "inc_hasta") {
+        const desde = sesionCoord.desde, hasta = bruto, estado = sesionCoord.estado;
+        if (hasta < desde) { await enviarMensaje(chatId, "La fecha 'hasta' es anterior a 'desde'. Escribe una válida."); return { statusCode: 200, body: "ok" }; }
+        await borrarSesion(chatId);
+        await reporteIncidentes(chatId, estado, desde, hasta);
+        return { statusCode: 200, body: "ok" };
+      }
+    }
 
     // Flujo de reporte de faltas (coordinador): capturar rango de fechas
     const sesionCoord = await leerSesion(chatId);
