@@ -143,12 +143,18 @@ const tecladoIniciar = { inline_keyboard: [
 ] };
 
 // Menú del turno en curso: ahora con Faltas
-const tecladoEnCurso = { inline_keyboard: [
-  [{ text: "👤 Registrar faltas", callback_data: "turno_faltas" }],
-  [{ text: "⚠️ Registrar incidente", callback_data: "turno_incidente" }],
-  [{ text: "📋 Incidentes pendientes", callback_data: "turno_pendientes" }],
-  [{ text: "✅ Entregar reporte del turno", callback_data: "turno_finalizar" }],
-] };
+// Menú del turno en curso. Los viernes agrega el botón de Resguardo.
+function tecladoEnCursoFn() {
+  const esViernes = new Date().getDay() === 5;
+  const filas = [
+    [{ text: "👤 Registrar faltas", callback_data: "turno_faltas" }],
+    [{ text: "⚠️ Registrar incidente", callback_data: "turno_incidente" }],
+    [{ text: "📋 Incidentes pendientes", callback_data: "turno_pendientes" }],
+  ];
+  if (esViernes) filas.push([{ text: "🔒 Resguardo de cajeros", callback_data: "turno_resguardo" }]);
+  filas.push([{ text: "✅ Entregar reporte del turno", callback_data: "turno_finalizar" }]);
+  return { inline_keyboard: filas };
+}
 
 const tecladoConfirmarCierre = { inline_keyboard: [
   [{ text: "Sí, entregar", callback_data: "turno_finalizar_si" }],
@@ -199,8 +205,8 @@ async function menuTurno(chatId, jefe, messageIdParaEditar = null) {
       (nPend ? `⚠️ Incidentes pendientes: <b>${nPend}</b>\n` : "");
     const texto = `<b>${jefe.instalacion.toUpperCase()}</b> · Turno <b>${NOMBRE_TURNO[abierto.turno]}</b> en curso\n${fechaBonita(abierto.fecha)}\n\n` +
       (contadores ? contadores + "\n" : "") + `¿Qué deseas hacer?`;
-    if (messageIdParaEditar) await editarMensaje(chatId, messageIdParaEditar, texto, { reply_markup: tecladoEnCurso });
-    else await enviarMensaje(chatId, texto, { reply_markup: tecladoEnCurso });
+    if (messageIdParaEditar) await editarMensaje(chatId, messageIdParaEditar, texto, { reply_markup: tecladoEnCursoFn() });
+    else await enviarMensaje(chatId, texto, { reply_markup: tecladoEnCursoFn() });
   } else {
     const texto = `<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(hoyISO())}\n\n¿Qué turno vas a iniciar?`;
     if (messageIdParaEditar) await editarMensaje(chatId, messageIdParaEditar, texto, { reply_markup: tecladoIniciar });
@@ -212,7 +218,7 @@ async function iniciarTurno(chatId, jefe, turno, callbackId, messageId) {
   const abierto = await turnoAbierto(jefe.instalacion);
   if (abierto) {
     await responderCallback(callbackId, "Ya tienes un turno abierto");
-    await editarMensaje(chatId, messageId, `⚠️ Ya tienes el turno <b>${NOMBRE_TURNO[abierto.turno]}</b> en curso.\nDebes entregarlo antes de iniciar otro.`, { reply_markup: tecladoEnCurso });
+    await editarMensaje(chatId, messageId, `⚠️ Ya tienes el turno <b>${NOMBRE_TURNO[abierto.turno]}</b> en curso.\nDebes entregarlo antes de iniciar otro.`, { reply_markup: tecladoEnCursoFn() });
     return;
   }
   const fecha = hoyISO(); const id = idTurno(jefe.instalacion, fecha, turno);
@@ -221,7 +227,7 @@ async function iniciarTurno(chatId, jefe, turno, callbackId, messageId) {
     if (existente.fecha === fecha) {
       await escribirDoc("turnos", id, { estado: "abierto", reabierto_en: new Date().toISOString() });
       await responderCallback(callbackId, "Turno reabierto");
-      await editarMensaje(chatId, messageId, `🔓 Turno <b>${NOMBRE_TURNO[turno]}</b> reabierto\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCurso });
+      await editarMensaje(chatId, messageId, `🔓 Turno <b>${NOMBRE_TURNO[turno]}</b> reabierto\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCursoFn() });
       return;
     } else {
       await responderCallback(callbackId, "Ese turno ya se cerró otro día");
@@ -235,7 +241,7 @@ async function iniciarTurno(chatId, jefe, turno, callbackId, messageId) {
   const avisoPend = pend.length
     ? `\n\n⚠️ <b>${pend.length} incidente(s) pendiente(s)</b> del turno anterior. Revísalos en "Incidentes pendientes".`
     : "";
-  await editarMensaje(chatId, messageId, `✅ Turno <b>${NOMBRE_TURNO[turno]}</b> iniciado\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}${avisoPend}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCurso });
+  await editarMensaje(chatId, messageId, `✅ Turno <b>${NOMBRE_TURNO[turno]}</b> iniciado\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}${avisoPend}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCursoFn() });
 }
 
 async function pedirConfirmacionCierre(chatId, jefe, callbackId, messageId) {
@@ -389,7 +395,7 @@ async function verPendientes(chatId, jefe, callbackId, messageId) {
   if (callbackId) await responderCallback(callbackId);
   if (!abiertos.length) {
     const texto = `<b>${jefe.instalacion.toUpperCase()}</b>\n\nNo hay incidentes pendientes. 👍`;
-    if (messageId) await editarMensaje(chatId, messageId, texto, { reply_markup: tecladoEnCurso });
+    if (messageId) await editarMensaje(chatId, messageId, texto, { reply_markup: tecladoEnCursoFn() });
     else await enviarMensaje(chatId, texto);
     return;
   }
@@ -409,6 +415,20 @@ async function cerrarIncidente(chatId, jefe, incId, callbackId, messageId) {
   await escribirDoc("eventos_inc", incId, { estado: "cerrado", cerrado_por: jefe.nombre, cerrado_en: new Date().toISOString() });
   await responderCallback(callbackId, "Incidente cerrado");
   await verPendientes(chatId, jefe, null, messageId);
+}
+
+// Inicia el flujo de resguardo desde el botón del turno (solo viernes)
+async function iniciarResguardoDesdeBoton(chatId, jefe, callbackId, messageId) {
+  const fecha = viernesDeEstaSemana();
+  if (await yaReportado(jefe.instalacion, fecha)) {
+    await responderCallback(callbackId, "Ya reportado");
+    await editarMensaje(chatId, messageId, `⚠️ Ya se reportó el resguardo de <b>${jefe.instalacion.toUpperCase()}</b> para el ${fechaBonita(fecha)}.`);
+    return;
+  }
+  const els = await elementosDe(jefe.instalacion);
+  await guardarSesion(chatId, { flujo: "resguardo", instalacion: jefe.instalacion, fecha, seleccion: [], paso: "seleccionando" });
+  await responderCallback(callbackId);
+  await editarMensaje(chatId, messageId, pintarListaResguardo(jefe.instalacion, fecha, els, []));
 }
 
 // ============ /exportar y /resumen ============
@@ -495,6 +515,7 @@ exports.handler = async (event) => {
       else if (data === "turno_pendientes") await verPendientes(chatId, jefe, cq.id, messageId);
       else if (data.startsWith("inc_cerrar_")) await cerrarIncidente(chatId, jefe, data.replace("inc_cerrar_", ""), cq.id, messageId);
       else if (data === "turno_volver") { await responderCallback(cq.id); await menuTurno(chatId, jefe, messageId); }
+      else if (data === "turno_resguardo") await iniciarResguardoDesdeBoton(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar") await pedirConfirmacionCierre(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_si") await finalizarTurno(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_no") { await responderCallback(cq.id, "Turno sigue abierto"); await menuTurno(chatId, jefe, messageId); }
