@@ -1,4 +1,6 @@
 // netlify/functions/bot.js
+// Bot v13: agrega /faltas (solo coordinador) — reporte por rango de fechas,
+// resumen en chat + CSV, marca lo exportado.
 // Bot v12: corrige clave/nombre "undefined" en faltas.
 // La sesión guarda solo índices (números) y motivos (strings) — arrays simples que
 // Firestore sí serializa. Clave y nombre se sacan de `elementos` fresco al guardar.
@@ -320,6 +322,38 @@ async function resumen(chatId) {
   await enviarMensaje(chatId, msg);
 }
 
+// Genera el reporte de faltas de un rango de fechas: resumen en chat + CSV
+async function reporteFaltas(chatId, desde, hasta) {
+  // Traer todas las faltas y filtrar por rango (fecha es AAAA-MM-DD, comparación de strings sirve)
+  const todas = await consultar("eventos", "tipo", "falta");
+  const enRango = todas.filter((f) => f.fecha >= desde && f.fecha <= hasta)
+    .sort((a, b) => (a.fecha + a.nombre).localeCompare(b.fecha + b.nombre, "es"));
+
+  if (!enRango.length) {
+    await enviarMensaje(chatId, `No hay faltas registradas entre ${fechaBonita(desde)} y ${fechaBonita(hasta)}.`);
+    return;
+  }
+
+  // Resumen en chat: agrupado por instalación
+  const porInst = {};
+  enRango.forEach((f) => { (porInst[f.instalacion] = porInst[f.instalacion] || []).push(f); });
+  let msg = `<b>Faltas</b> · ${fechaBonita(desde)} a ${fechaBonita(hasta)}\n\n`;
+  for (const inst of Object.keys(porInst).sort()) {
+    msg += `<b>${inst.toUpperCase()}</b>\n`;
+    porInst[inst].forEach((f) => { msg += `• ${f.nombre} — ${f.motivo} (${fechaBonita(f.fecha)})\n`; });
+    msg += "\n";
+  }
+  msg += `Total: <b>${enRango.length}</b> falta(s).`;
+  await enviarMensaje(chatId, msg);
+
+  // CSV para copiar al formato de RH
+  const csv = [
+    ["CLAVE", "NOMBRE", "FECHA", "MOTIVO", "INSTALACION"].join(","),
+    ...enRango.map((f) => [f.clave, f.nombre, f.fecha, f.motivo, f.instalacion].map(csvCampo).join(",")),
+  ].join("\r\n");
+  await enviarDocumento(chatId, `faltas_${desde}_a_${hasta}.csv`, csv, "Faltas para RH");
+}
+
 // ============ Handler ============
 
 exports.handler = async (event) => {
@@ -365,7 +399,36 @@ exports.handler = async (event) => {
     if (texto.startsWith("/resumen")) { if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; } await resumen(chatId); return { statusCode: 200, body: "ok" }; }
     if (texto.startsWith("/exportar")) { if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; } await exportar(chatId); return { statusCode: 200, body: "ok" }; }
 
-    if (!jefe) { await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín."); return { statusCode: 200, body: "ok" }; }
+    if (texto.startsWith("/faltas")) {
+      if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; }
+      await guardarSesion(chatId, { flujo: "faltas_reporte", paso: "faltas_desde" });
+      await enviarMensaje(chatId, "<b>Reporte de faltas para RH</b>\n\nEscribe la fecha <b>desde</b> (formato <code>AAAA-MM-DD</code>).\nEj: <code>2026-08-01</code>");
+      return { statusCode: 200, body: "ok" };
+    }
+
+    if (!jefe && !esCoordinador(telegramId)) { await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín."); return { statusCode: 200, body: "ok" }; }
+
+    // Flujo de reporte de faltas (coordinador): capturar rango de fechas
+    const sesionCoord = await leerSesion(chatId);
+    if (sesionCoord && sesionCoord.flujo === "faltas_reporte") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
+      if (sesionCoord.paso === "faltas_desde") {
+        await guardarSesion(chatId, { ...sesionCoord, desde: bruto, paso: "faltas_hasta" });
+        await enviarMensaje(chatId, `Desde: <b>${fechaBonita(bruto)}</b>\n\nAhora la fecha <b>hasta</b> (<code>AAAA-MM-DD</code>).`);
+        return { statusCode: 200, body: "ok" };
+      }
+      if (sesionCoord.paso === "faltas_hasta") {
+        const desde = sesionCoord.desde, hasta = bruto;
+        if (hasta < desde) { await enviarMensaje(chatId, "La fecha 'hasta' es anterior a 'desde'. Escribe una fecha válida."); return { statusCode: 200, body: "ok" }; }
+        await borrarSesion(chatId);
+        await reporteFaltas(chatId, desde, hasta);
+        return { statusCode: 200, body: "ok" };
+      }
+    }
+
+    // A partir de aquí se requiere ser jefe (tener instalación). Un coordinador sin
+    // registro de jefe solo puede usar /resumen, /exportar y /faltas (ya manejados arriba).
+    if (!jefe) { await enviarMensaje(chatId, "Como coordinador puedes usar /resumen, /exportar y /faltas."); return { statusCode: 200, body: "ok" }; }
 
     if (texto.startsWith("/turno")) { await menuTurno(chatId, jefe); return { statusCode: 200, body: "ok" }; }
     if (texto.startsWith("/cancelar")) { await borrarSesion(chatId); await enviarMensaje(chatId, "Operación cancelada."); return { statusCode: 200, body: "ok" }; }
