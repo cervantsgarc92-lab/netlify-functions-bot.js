@@ -1,4 +1,6 @@
 // netlify/functions/bot.js
+// Bot v17: Fallas (grupo + descripción, folio CFE en eléctricas), nacen abiertas,
+//          se heredan hasta reparar; reporte /fallas para coordinador.
 // Bot v16: /incidentes (coordinador) — elige estado (todos/abiertos/cerrados),
 // rango de fechas, devuelve resumen + CSV.
 // Bot v14: Incidentes (categoría grupo->tipo + descripción), nacen abiertos,
@@ -166,6 +168,8 @@ function tecladoEnCursoFn() {
     [{ text: "👤 Registrar faltas", callback_data: "turno_faltas" }],
     [{ text: "⚠️ Registrar incidente", callback_data: "turno_incidente" }],
     [{ text: "📋 Incidentes pendientes", callback_data: "turno_pendientes" }],
+    [{ text: "🔧 Registrar falla", callback_data: "turno_falla" }],
+    [{ text: "🛠️ Fallas pendientes", callback_data: "turno_fallas_pend" }],
   ];
   if (esViernes) filas.push([{ text: "🔒 Resguardo de cajeros", callback_data: "turno_resguardo" }]);
   filas.push([{ text: "✅ Entregar reporte del turno", callback_data: "turno_finalizar" }]);
@@ -210,6 +214,21 @@ function tecladoTipoIncidente(grupo) {
   return { inline_keyboard: Object.entries(tipos).map(([k, v]) => [{ text: v, callback_data: `inc_tipo_${grupo}_${k}` }]) };
 }
 
+// ---- Grupos de falla ----
+const GRUPOS_FALLA = {
+  electrica: "Eléctrica",
+  cajero: "Cajero automático",
+  instalacion: "Instalaciones (alumbrado, daños)",
+  agua: "Fuga de agua (baños, tuberías)",
+};
+
+const tecladoGrupoFalla = { inline_keyboard: [
+  [{ text: "⚡ Eléctrica", callback_data: "falla_grupo_electrica" }],
+  [{ text: "🏧 Cajero automático", callback_data: "falla_grupo_cajero" }],
+  [{ text: "🏚️ Instalaciones", callback_data: "falla_grupo_instalacion" }],
+  [{ text: "💧 Fuga de agua", callback_data: "falla_grupo_agua" }],
+] };
+
 async function menuTurno(chatId, jefe, messageIdParaEditar = null) {
   const abierto = await turnoAbierto(jefe.instalacion);
   if (abierto) {
@@ -217,8 +236,10 @@ async function menuTurno(chatId, jefe, messageIdParaEditar = null) {
     const faltas = await consultar("eventos", "turno_id", abierto.id);
     const nFaltas = faltas.filter((e) => e.tipo === "falta").length;
     const nPend = (await incidentesAbiertos(jefe.instalacion)).length;
+    const nPendF = (await fallasAbiertas(jefe.instalacion)).length;
     const contadores = (nFaltas ? `Faltas registradas: <b>${nFaltas}</b>\n` : "") +
-      (nPend ? `⚠️ Incidentes pendientes: <b>${nPend}</b>\n` : "");
+      (nPend ? `⚠️ Incidentes pendientes: <b>${nPend}</b>\n` : "") +
+      (nPendF ? `🔧 Fallas pendientes: <b>${nPendF}</b>\n` : "");
     const texto = `<b>${jefe.instalacion.toUpperCase()}</b> · Turno <b>${NOMBRE_TURNO[abierto.turno]}</b> en curso\n${fechaBonita(abierto.fecha)}\n\n` +
       (contadores ? contadores + "\n" : "") + `¿Qué deseas hacer?`;
     if (messageIdParaEditar) await editarMensaje(chatId, messageIdParaEditar, texto, { reply_markup: tecladoEnCursoFn() });
@@ -254,9 +275,10 @@ async function iniciarTurno(chatId, jefe, turno, callbackId, messageId) {
   await escribirDoc("turnos", id, { instalacion: jefe.instalacion, fecha, turno, estado: "abierto", jefe_abrio: jefe.nombre, abierto_en: new Date().toISOString() });
   await responderCallback(callbackId, "Turno iniciado");
   const pend = await incidentesAbiertos(jefe.instalacion);
-  const avisoPend = pend.length
-    ? `\n\n⚠️ <b>${pend.length} incidente(s) pendiente(s)</b> del turno anterior. Revísalos en "Incidentes pendientes".`
-    : "";
+  const pendF = await fallasAbiertas(jefe.instalacion);
+  let avisoPend = "";
+  if (pend.length) avisoPend += `\n\n⚠️ <b>${pend.length} incidente(s) pendiente(s)</b> del turno anterior.`;
+  if (pendF.length) avisoPend += `\n🔧 <b>${pendF.length} falla(s) pendiente(s)</b> sin reparar.`;
   await editarMensaje(chatId, messageId, `✅ Turno <b>${NOMBRE_TURNO[turno]}</b> iniciado\n<b>${jefe.instalacion.toUpperCase()}</b> · ${fechaBonita(fecha)}${avisoPend}\n\n¿Qué deseas hacer?`, { reply_markup: tecladoEnCursoFn() });
 }
 
@@ -447,6 +469,77 @@ async function iniciarResguardoDesdeBoton(chatId, jefe, callbackId, messageId) {
   await editarMensaje(chatId, messageId, pintarListaResguardo(jefe.instalacion, fecha, els, []));
 }
 
+// ---- Fallas ----
+
+async function fallasAbiertas(instalacion) {
+  return await consultar2("fallas", "instalacion", instalacion, "estado", "abierto");
+}
+
+// Inicia registro de falla: elegir grupo
+async function iniciarFalla(chatId, jefe, callbackId, messageId) {
+  const abierto = await turnoAbierto(jefe.instalacion);
+  if (!abierto) { await responderCallback(callbackId, "No hay turno abierto"); return; }
+  await guardarSesion(chatId, { flujo: "falla", turno_id: abierto.id, instalacion: jefe.instalacion, paso: "falla_grupo" });
+  await responderCallback(callbackId);
+  await editarMensaje(chatId, messageId, `<b>Registrar falla</b>\n\n¿De qué tipo?`, { reply_markup: tecladoGrupoFalla });
+}
+
+// Recibe el grupo -> si es eléctrica pide folio CFE, si no pide descripción
+async function fallaGrupo(chatId, jefe, grupo, callbackId, messageId) {
+  const sesion = await leerSesion(chatId);
+  if (!sesion || sesion.flujo !== "falla") { await responderCallback(callbackId); return; }
+  await responderCallback(callbackId);
+  if (grupo === "electrica") {
+    await guardarSesion(chatId, { ...sesion, grupo, paso: "falla_folio" });
+    await editarMensaje(chatId, messageId, `<b>${GRUPOS_FALLA[grupo]}</b>\n\nEscribe el <b>folio CFE</b> del reporte.\nSi no tienes folio, escribe <code>sin folio</code>.`);
+  } else {
+    await guardarSesion(chatId, { ...sesion, grupo, folio: "", paso: "falla_descripcion" });
+    await editarMensaje(chatId, messageId, `<b>${GRUPOS_FALLA[grupo]}</b>\n\nDescribe la falla:`);
+  }
+}
+
+// Guarda la falla (nace abierta)
+async function guardarFalla(chatId, jefe, sesion, descripcion) {
+  await crearDoc("fallas", {
+    instalacion: sesion.instalacion, turno_id_origen: sesion.turno_id,
+    grupo: GRUPOS_FALLA[sesion.grupo], folio_cfe: sesion.folio || "",
+    descripcion, estado: "abierto", reportado_por: jefe.nombre,
+    fecha: hoyISO(), creado_en: new Date().toISOString(),
+  });
+  await borrarSesion(chatId);
+  const folioTxt = sesion.folio ? `\nFolio CFE: <b>${sesion.folio}</b>` : "";
+  await enviarMensaje(chatId, `✅ Falla registrada (queda <b>abierta</b>):\n\n<b>${GRUPOS_FALLA[sesion.grupo]}</b>${folioTxt}\n${descripcion}`);
+  await menuTurno(chatId, jefe);
+}
+
+// Ver fallas pendientes con botón para marcar reparada
+async function verFallasPendientes(chatId, jefe, callbackId, messageId) {
+  const abiertas = await fallasAbiertas(jefe.instalacion);
+  if (callbackId) await responderCallback(callbackId);
+  if (!abiertas.length) {
+    const texto = `<b>${jefe.instalacion.toUpperCase()}</b>\n\nNo hay fallas pendientes. 👍`;
+    if (messageId) await editarMensaje(chatId, messageId, texto, { reply_markup: tecladoEnCursoFn() });
+    else await enviarMensaje(chatId, texto);
+    return;
+  }
+  let texto = `<b>Fallas pendientes</b> · ${jefe.instalacion.toUpperCase()}\n\n`;
+  const botones = [];
+  abiertas.forEach((f, i) => {
+    const folioTxt = f.folio_cfe ? ` (CFE: ${f.folio_cfe})` : "";
+    texto += `${i + 1}. <b>${f.grupo}</b>${folioTxt}\n${f.descripcion}\n<i>Desde ${fechaBonita(f.fecha)}, reportó ${f.reportado_por}</i>\n\n`;
+    botones.push([{ text: `🛠️ Reparada #${i + 1}`, callback_data: `falla_cerrar_${f.id}` }]);
+  });
+  botones.push([{ text: "« Volver", callback_data: "turno_volver" }]);
+  if (messageId) await editarMensaje(chatId, messageId, texto, { reply_markup: { inline_keyboard: botones } });
+  else await enviarMensaje(chatId, texto, { reply_markup: { inline_keyboard: botones } });
+}
+
+async function cerrarFalla(chatId, jefe, fallaId, callbackId, messageId) {
+  await escribirDoc("fallas", fallaId, { estado: "cerrado", reparada_por: jefe.nombre, reparada_en: new Date().toISOString() });
+  await responderCallback(callbackId, "Falla marcada como reparada");
+  await verFallasPendientes(chatId, jefe, null, messageId);
+}
+
 // ============ /exportar y /resumen ============
 
 async function exportar(chatId) {
@@ -546,6 +639,43 @@ async function reporteIncidentes(chatId, estado, desde, hasta) {
   await enviarDocumento(chatId, `incidentes_${estado}_${desde}_a_${hasta}.csv`, csv, "Incidentes");
 }
 
+// Reporte de fallas por rango y estado: resumen + CSV
+async function reporteFallas(chatId, estado, desde, hasta) {
+  const fallas = (await listar("fallas"))
+    .filter((x) => x.fecha >= desde && x.fecha <= hasta)
+    .filter((x) => estado === "todos" ? true : x.estado === estado)
+    .sort((a, b) => (a.fecha + a.instalacion).localeCompare(b.fecha + b.instalacion, "es"));
+
+  const etiquetaEstado = { todos: "Todas", abierto: "Abiertas", cerrado: "Reparadas" }[estado];
+
+  if (!fallas.length) {
+    await enviarMensaje(chatId, `No hay fallas (${etiquetaEstado.toLowerCase()}) entre ${fechaBonita(desde)} y ${fechaBonita(hasta)}.`);
+    return;
+  }
+
+  const porInst = {};
+  fallas.forEach((x) => { (porInst[x.instalacion] = porInst[x.instalacion] || []).push(x); });
+  let msg = `<b>Fallas · ${etiquetaEstado}</b>\n${fechaBonita(desde)} a ${fechaBonita(hasta)}\n\n`;
+  for (const instk of Object.keys(porInst).sort()) {
+    msg += `<b>${instk.toUpperCase()}</b>\n`;
+    porInst[instk].forEach((x) => {
+      const marca = x.estado === "abierto" ? "🔧" : "✅";
+      const folio = x.folio_cfe ? ` [CFE ${x.folio_cfe}]` : "";
+      msg += `${marca} ${x.grupo}${folio}\n   ${x.descripcion}\n   <i>${fechaBonita(x.fecha)}, ${x.reportado_por}${x.estado === "cerrado" && x.reparada_por ? ` — reparó ${x.reparada_por}` : ""}</i>\n`;
+    });
+    msg += "\n";
+  }
+  msg += `Total: <b>${fallas.length}</b> falla(s).`;
+  if (msg.length > 3800) await enviarMensaje(chatId, `<b>Fallas · ${etiquetaEstado}</b>\n${fechaBonita(desde)} a ${fechaBonita(hasta)}\n\nSon <b>${fallas.length}</b> fallas, demasiadas para mostrar aquí. Te mando el CSV.`);
+  else await enviarMensaje(chatId, msg);
+
+  const csv = [
+    ["FECHA", "INSTALACION", "GRUPO", "FOLIO_CFE", "DESCRIPCION", "ESTADO", "REPORTO", "REPARO"].join(","),
+    ...fallas.map((x) => [x.fecha, x.instalacion, x.grupo, x.folio_cfe || "", x.descripcion, x.estado, x.reportado_por, x.reparada_por || ""].map(csvCampo).join(",")),
+  ].join("\r\n");
+  await enviarDocumento(chatId, `fallas_${estado}_${desde}_a_${hasta}.csv`, csv, "Fallas");
+}
+
 // ============ Handler ============
 
 exports.handler = async (event) => {
@@ -562,10 +692,18 @@ exports.handler = async (event) => {
       // Botones de reporte de incidentes (coordinador) — antes del guard de jefe
       if (data.startsWith("rep_inc_")) {
         if (!esCoordinador(telegramId)) { await responderCallback(cq.id, "Solo coordinador"); return { statusCode: 200, body: "ok" }; }
-        const estado = data.replace("rep_inc_", ""); // todos | abierto | cerrado
+        const estado = data.replace("rep_inc_", "");
         await guardarSesion(chatId, { flujo: "inc_reporte", estado, paso: "inc_desde" });
         await responderCallback(cq.id);
         await editarMensaje(chatId, messageId, `<b>Reporte de incidentes</b>\n\nEscribe la fecha <b>desde</b> (<code>AAAA-MM-DD</code>). Ej: <code>2026-08-01</code>`);
+        return { statusCode: 200, body: "ok" };
+      }
+      if (data.startsWith("rep_falla_")) {
+        if (!esCoordinador(telegramId)) { await responderCallback(cq.id, "Solo coordinador"); return { statusCode: 200, body: "ok" }; }
+        const estado = data.replace("rep_falla_", "");
+        await guardarSesion(chatId, { flujo: "falla_reporte", estado, paso: "falla_rep_desde" });
+        await responderCallback(cq.id);
+        await editarMensaje(chatId, messageId, `<b>Reporte de fallas</b>\n\nEscribe la fecha <b>desde</b> (<code>AAAA-MM-DD</code>). Ej: <code>2026-08-01</code>`);
         return { statusCode: 200, body: "ok" };
       }
 
@@ -583,6 +721,10 @@ exports.handler = async (event) => {
       else if (data.startsWith("inc_cerrar_")) await cerrarIncidente(chatId, jefe, data.replace("inc_cerrar_", ""), cq.id, messageId);
       else if (data === "turno_volver") { await responderCallback(cq.id); await menuTurno(chatId, jefe, messageId); }
       else if (data === "turno_resguardo") await iniciarResguardoDesdeBoton(chatId, jefe, cq.id, messageId);
+      else if (data === "turno_falla") await iniciarFalla(chatId, jefe, cq.id, messageId);
+      else if (data.startsWith("falla_grupo_")) await fallaGrupo(chatId, jefe, data.replace("falla_grupo_", ""), cq.id, messageId);
+      else if (data === "turno_fallas_pend") await verFallasPendientes(chatId, jefe, cq.id, messageId);
+      else if (data.startsWith("falla_cerrar_")) await cerrarFalla(chatId, jefe, data.replace("falla_cerrar_", ""), cq.id, messageId);
       else if (data === "turno_finalizar") await pedirConfirmacionCierre(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_si") await finalizarTurno(chatId, jefe, cq.id, messageId);
       else if (data === "turno_finalizar_no") { await responderCallback(cq.id, "Turno sigue abierto"); await menuTurno(chatId, jefe, messageId); }
@@ -625,7 +767,34 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: "ok" };
     }
 
+    if (texto.startsWith("/fallas")) {
+      if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; }
+      await enviarMensaje(chatId, "<b>Reporte de fallas</b>\n\n¿Cuáles quieres ver?", { reply_markup: { inline_keyboard: [
+        [{ text: "Todas", callback_data: "rep_falla_todos" }],
+        [{ text: "🔧 Solo abiertas", callback_data: "rep_falla_abierto" }],
+        [{ text: "✅ Solo reparadas", callback_data: "rep_falla_cerrado" }],
+      ] } });
+      return { statusCode: 200, body: "ok" };
+    }
+
     if (!jefe && !esCoordinador(telegramId)) { await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín."); return { statusCode: 200, body: "ok" }; }
+
+    // Flujo de reporte de fallas (coordinador): capturar rango
+    if (sesionCoord && sesionCoord.flujo === "falla_reporte") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
+      if (sesionCoord.paso === "falla_rep_desde") {
+        await guardarSesion(chatId, { ...sesionCoord, desde: bruto, paso: "falla_rep_hasta" });
+        await enviarMensaje(chatId, `Desde: <b>${fechaBonita(bruto)}</b>\n\nAhora la fecha <b>hasta</b> (<code>AAAA-MM-DD</code>).`);
+        return { statusCode: 200, body: "ok" };
+      }
+      if (sesionCoord.paso === "falla_rep_hasta") {
+        const desde = sesionCoord.desde, hasta = bruto, estado = sesionCoord.estado;
+        if (hasta < desde) { await enviarMensaje(chatId, "La fecha 'hasta' es anterior a 'desde'. Escribe una válida."); return { statusCode: 200, body: "ok" }; }
+        await borrarSesion(chatId);
+        await reporteFallas(chatId, estado, desde, hasta);
+        return { statusCode: 200, body: "ok" };
+      }
+    }
 
     // Flujo de reporte de incidentes (coordinador): capturar rango
     if (sesionCoord && sesionCoord.flujo === "inc_reporte") {
@@ -680,6 +849,21 @@ exports.handler = async (event) => {
 
     const sesion = await leerSesion(chatId);
     if (!sesion || !sesion.paso) { await enviarMensaje(chatId, "Usa /turno o /resguardo para comenzar."); return { statusCode: 200, body: "ok" }; }
+
+    // ===== Flujo de FALLA =====
+    if (sesion.flujo === "falla") {
+      if (sesion.paso === "falla_folio") {
+        const folio = texto === "sin folio" ? "" : bruto;
+        await guardarSesion(chatId, { ...sesion, folio, paso: "falla_descripcion" });
+        await enviarMensaje(chatId, `${folio ? `Folio: <b>${folio}</b>\n\n` : ""}Ahora describe la falla:`);
+        return { statusCode: 200, body: "ok" };
+      }
+      if (sesion.paso === "falla_descripcion") {
+        if (bruto.length < 3) { await enviarMensaje(chatId, "Escribe una descripción un poco más completa."); return { statusCode: 200, body: "ok" }; }
+        await guardarFalla(chatId, jefe, sesion, bruto);
+        return { statusCode: 200, body: "ok" };
+      }
+    }
 
     // ===== Flujo de INCIDENTE (descripción por texto) =====
     if (sesion.flujo === "incidente" && sesion.paso === "descripcion") {
