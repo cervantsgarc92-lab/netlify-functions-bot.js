@@ -1,4 +1,5 @@
 // netlify/functions/bot.js
+// Bot v18: /turnos (coordinador) — resumen de turnos por instalación y día.
 // Bot v17: Fallas (grupo + descripción, folio CFE en eléctricas), nacen abiertas,
 //          se heredan hasta reparar; reporte /fallas para coordinador.
 // Bot v16: /incidentes (coordinador) — elige estado (todos/abiertos/cerrados),
@@ -676,6 +677,56 @@ async function reporteFallas(chatId, estado, desde, hasta) {
   await enviarDocumento(chatId, `fallas_${estado}_${desde}_a_${hasta}.csv`, csv, "Fallas");
 }
 
+// Resumen de turnos de una instalación en un día
+async function reporteTurnos(chatId, instalacion, fecha) {
+  const turnos = (await listar("turnos"))
+    .filter((t) => t.instalacion === instalacion && t.fecha === fecha)
+    .sort((a, b) => ({ manana: 0, tarde: 1, noche: 2 }[a.turno] - { manana: 0, tarde: 1, noche: 2 }[b.turno]));
+
+  if (!turnos.length) {
+    await enviarMensaje(chatId, `No hay turnos registrados en <b>${instalacion.toUpperCase()}</b> el ${fechaBonita(fecha)}.`);
+    return;
+  }
+
+  // Datos del día para esa instalación (una sola lectura de cada colección)
+  const faltasDia = (await listar("eventos")).filter((e) => e.tipo === "falta" && e.instalacion === instalacion && e.fecha === fecha);
+  const incDia = (await listar("eventos_inc")).filter((x) => x.instalacion === instalacion && x.fecha === fecha);
+  const fallasDia = (await listar("fallas")).filter((x) => x.instalacion === instalacion && x.fecha === fecha);
+
+  let msg = `<b>Turnos · ${instalacion.toUpperCase()}</b>\n${fechaBonita(fecha)}\n\n`;
+  for (const t of turnos) {
+    const faltasT = faltasDia.filter((f) => f.turno_id === t.id);
+    const incT = incDia.filter((x) => x.turno_id_origen === t.id);
+    const fallasT = fallasDia.filter((x) => x.turno_id_origen === t.id);
+    const estadoT = t.estado === "cerrado" ? "✅ Entregado" : "🟡 En curso";
+    msg += `<b>${NOMBRE_TURNO[t.turno]}</b> — ${estadoT}\n`;
+    msg += `Abrió: ${t.jefe_abrio || "?"}`;
+    if (t.jefe_cerro) msg += ` · Entregó: ${t.jefe_cerro}`;
+    msg += `\n`;
+    msg += `Faltas: ${faltasT.length} · Incidentes: ${incT.length} · Fallas: ${fallasT.length}\n`;
+    // Detalle breve de incidentes y fallas (por ser lo relevante)
+    incT.forEach((x) => { msg += `   ⚠️ ${x.tipo}: ${x.descripcion}\n`; });
+    fallasT.forEach((x) => { msg += `   🔧 ${x.grupo}: ${x.descripcion}\n`; });
+    msg += `\n`;
+  }
+  msg += `<i>Para el detalle completo usa /faltas, /incidentes o /fallas.</i>`;
+
+  if (msg.length > 3900) {
+    // Si es muy largo, recortar el detalle
+    let corto = `<b>Turnos · ${instalacion.toUpperCase()}</b>\n${fechaBonita(fecha)}\n\n`;
+    for (const t of turnos) {
+      const faltasT = faltasDia.filter((f) => f.turno_id === t.id).length;
+      const incT = incDia.filter((x) => x.turno_id_origen === t.id).length;
+      const fallasT = fallasDia.filter((x) => x.turno_id_origen === t.id).length;
+      const estadoT = t.estado === "cerrado" ? "✅" : "🟡";
+      corto += `${estadoT} <b>${NOMBRE_TURNO[t.turno]}</b> — Abrió ${t.jefe_abrio || "?"}${t.jefe_cerro ? `, entregó ${t.jefe_cerro}` : ""}\n   Faltas ${faltasT} · Incidentes ${incT} · Fallas ${fallasT}\n\n`;
+    }
+    await enviarMensaje(chatId, corto);
+  } else {
+    await enviarMensaje(chatId, msg);
+  }
+}
+
 // ============ Handler ============
 
 exports.handler = async (event) => {
@@ -704,6 +755,14 @@ exports.handler = async (event) => {
         await guardarSesion(chatId, { flujo: "falla_reporte", estado, paso: "falla_rep_desde" });
         await responderCallback(cq.id);
         await editarMensaje(chatId, messageId, `<b>Reporte de fallas</b>\n\nEscribe la fecha <b>desde</b> (<code>AAAA-MM-DD</code>). Ej: <code>2026-08-01</code>`);
+        return { statusCode: 200, body: "ok" };
+      }
+      if (data.startsWith("rep_turnos_")) {
+        if (!esCoordinador(telegramId)) { await responderCallback(cq.id, "Solo coordinador"); return { statusCode: 200, body: "ok" }; }
+        const inst = data.replace("rep_turnos_", "");
+        await guardarSesion(chatId, { flujo: "turnos_reporte", instalacion: inst, paso: "turnos_fecha" });
+        await responderCallback(cq.id);
+        await editarMensaje(chatId, messageId, `<b>${inst.toUpperCase()}</b>\n\n¿De qué día? Escribe la fecha (<code>AAAA-MM-DD</code>).\nEj: <code>${hoyISO()}</code> (hoy)`);
         return { statusCode: 200, body: "ok" };
       }
 
@@ -777,9 +836,25 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: "ok" };
     }
 
+    if (texto.startsWith("/turnos")) {
+      if (!esCoordinador(telegramId)) { await enviarMensaje(chatId, "Este comando es solo para el coordinador."); return { statusCode: 200, body: "ok" }; }
+      await enviarMensaje(chatId, "<b>Resumen de turnos</b>\n\n¿De qué instalación?", { reply_markup: { inline_keyboard:
+        INSTALACIONES_ACTIVAS.map((i) => [{ text: i.toUpperCase(), callback_data: `rep_turnos_${i}` }]),
+      } });
+      return { statusCode: 200, body: "ok" };
+    }
+
     if (!jefe && !esCoordinador(telegramId)) { await enviarMensaje(chatId, "No estás dado de alta. Usa /start y envía tu ID a Efraín."); return { statusCode: 200, body: "ok" }; }
 
     const sesionCoord = await leerSesion(chatId);
+
+    // Flujo de resumen de turnos (coordinador): capturar día
+    if (sesionCoord && sesionCoord.flujo === "turnos_reporte") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(bruto)) { await enviarMensaje(chatId, "Formato inválido. Usa <code>AAAA-MM-DD</code>."); return { statusCode: 200, body: "ok" }; }
+      await borrarSesion(chatId);
+      await reporteTurnos(chatId, sesionCoord.instalacion, bruto);
+      return { statusCode: 200, body: "ok" };
+    }
 
     // Flujo de reporte de fallas (coordinador): capturar rango
     if (sesionCoord && sesionCoord.flujo === "falla_reporte") {
